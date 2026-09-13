@@ -1,0 +1,115 @@
+name: Build enuma kernel (SukiSU dual-line)
+
+# Builds both KernelSU lines of the enuma (Xiaomi Pad 5 Pro 5G) MIUI kernel:
+#   susfs=0 -> clean line, SukiSU v4.2.0 (4.x, metamodule capable)
+#   susfs=1 -> SUSFS line, KernelSU with the in-kernel SUSFS 1.5.7 glue
+# Each job produces one anykernel3 zip named Kernel_MIUI_enuma_*.
+#
+# Scope (t3/M1): only the MIUI variant is built and verified here - every job of
+# this workflow pins MIUI_ONLY=1. build.sh's AOSP block (MIUI_ONLY=0) is NOT
+# exercised by CI and is therefore unverified in this delivery (the AOSP variant
+# is out of scope); it is kept for local/manual use only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Target device (defconfig prefix, e.g. enuma)"
+        required: false
+        default: "enuma"
+        type: string
+      miui_only:
+        description: "Build the MIUI variant only (1 = yes; 0 = also build AOSP, NOT exercised by CI)"
+        required: false
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (susfs=${{ matrix.susfs }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        susfs: [0, 1]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git curl wget zip unzip ccache make bc bison flex \
+            libssl-dev libelf-dev python3 cpio rsync patch
+          git --version
+
+      - name: Install proton-clang 20210522
+        run: |
+          mkdir -p $HOME/proton-clang
+          cd $HOME/proton-clang
+          wget -q https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.zip
+          unzip -q 20210522.zip
+          test -x $HOME/proton-clang/proton-clang-20210522/bin/clang
+          $HOME/proton-clang/proton-clang-20210522/bin/clang --version
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache_mikernel
+          key: ccache-${{ matrix.susfs }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.susfs }}-
+
+      - name: Add swap
+        run: |
+          sudo fallocate -l 8G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      - name: Build (WITH_SUSFS=${{ matrix.susfs }})
+        env:
+          MIUI_ONLY: ${{ inputs.miui_only }}
+          WITH_SUSFS: ${{ matrix.susfs }}
+        run: |
+          set -o pipefail
+          bash build.sh "${{ inputs.device }}" ksu 2>&1 | tee build-susfs${{ matrix.susfs }}.log
+
+      - name: Upload kernel zip
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel_MIUI_enuma_susfs${{ matrix.susfs }}-${{ github.run_number }}
+          # t3/M2: one glob per line. "Kernel_MIUI_enuma_SukiSU_*" (susfs=0) and
+          # "Kernel_MIUI_enuma_SukiSU-SUSFS_*" (susfs=1) are disjoint, so an
+          # artifact can never contain the other line's zip.
+          path: Kernel_MIUI_enuma_SukiSU${{ matrix.susfs == 1 && '-SUSFS' || '' }}_*.zip
+          if-no-files-found: ${{ matrix.susfs == 0 && 'error' || 'ignore' }}
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-susfs${{ matrix.susfs }}-${{ github.run_number }}
+          path: build-susfs${{ matrix.susfs }}.log
+          if-no-files-found: warn
