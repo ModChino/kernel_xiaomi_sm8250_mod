@@ -373,6 +373,174 @@ KSU419EOF
         echo "NOTE: KernelSU/kernel/feature/sucompat.c not present (3.x SUSFS tree) - the 4.19 compat sweep is not needed."
     fi
 
+    # t28: KernelSU v4.2.0 also calls three Linux 5.8+ "maccess" wrappers that
+    # 4.19 does not have: strncpy_from_user_nofault() (5 call sites: feature/sucompat.c
+    # x2, runtime/ksud_integration.c, sulog/event.c x2), copy_to_user_nofault()
+    # (runtime/ksud_integration.c) and copy_to_kernel_nofault() (hook/*/patch_memory.c).
+    # t31/F1: the original claim that copy_to_kernel_nofault() is "compiled out by
+    # `#if KSU_NEW_DCACHE_FLUSH`" was WRONG - that guard only wraps the two
+    # ksu_flush_* macro definitions (hook/arm64/patch_memory.c L92-103), while the
+    # call at L150 sits under `#ifdef __aarch64__` only, and hook/arm64/patch_memory.o
+    # is unconditionally in kernelsu-objs. It is therefore a real 4.19 blocker and is
+    # shimmed here. The user-space strncpy shim mirrors mainline v5.8 mm/maccess.c.
+    if [ -f KernelSU/kernel/feature/sucompat.c ]; then
+        KSUK=KernelSU/kernel
+        if ! grep -qs 'ksu_copy_to_kernel_nofault' "$KSUK/include/ksu_419_compat.h"; then
+            cat > "$KSUK/include/ksu_419_compat.h" <<'KSU419HDR'
+/* t28: Linux 4.19 compatibility shims for the 5.8+ "maccess" wrappers used by
+ * KernelSU v4.2.0. Included from every file that calls one of them. */
+#ifndef __KSU_419_COMPAT_H
+#define __KSU_419_COMPAT_H
+
+#include <linux/uaccess.h>
+#include <linux/version.h>
+#include <asm/processor.h> /* USER_DS lives here on this 4.19 arm64 tree */
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+/*
+ * strncpy_from_user_nofault() arrived in 5.8 (mm/maccess.c). This body mirrors
+ * mainline v5.8 verbatim: strncpy_from_user() with pagefault handling disabled,
+ * then mainline's return-value fixup (length including the trailing NUL; @count
+ * when truncated, with the last byte set to NUL). 4.19 supplies every primitive
+ * (get_fs/set_fs/USER_DS, pagefault_disable/enable, strncpy_from_user), and its
+ * strncpy_from_user() has the same "length without the NUL" contract 5.8 relies
+ * on. Unlike the copy_from_user_nofault+strnlen approximation this does not
+ * report a spurious -EFAULT for a short string next to an unmapped page.
+ */
+static inline long ksu_strncpy_from_user_nofault(char *dst, const void __user *unsafe_addr, long count)
+{
+    mm_segment_t old_fs = get_fs();
+    long ret;
+
+    if (unlikely(count <= 0))
+        return 0;
+
+    set_fs(USER_DS);
+    pagefault_disable();
+    ret = strncpy_from_user(dst, unsafe_addr, count);
+    pagefault_enable();
+    set_fs(old_fs);
+
+    if (ret >= count) {
+        ret = count;
+        dst[ret - 1] = '\0';
+    } else if (ret > 0) {
+        ret++;
+    }
+
+    return ret;
+}
+
+/* copy_to_user_nofault() arrived in 5.8; 4.19 has probe_user_write() with the
+ * same contract (0 on success, -EFAULT when the access faults). */
+static inline long ksu_copy_to_user_nofault(void __user *dst, const void *src, size_t size)
+{
+    return probe_user_write(dst, src, size);
+}
+
+/* t31: copy_to_kernel_nofault() is 5.8+ (mm/maccess.c); 4.19 spells it
+ * probe_kernel_write(). Same contract: 0 on success, -EFAULT on fault.
+ * Called from hook/arm64/patch_memory.c, whose object is unconditionally in
+ * kernelsu-objs. */
+static inline long ksu_copy_to_kernel_nofault(void *dst, const void *src, size_t size)
+{
+    return probe_kernel_write(dst, src, size);
+}
+#endif /* LINUX_VERSION_CODE < 5.8 */
+
+#endif /* __KSU_419_COMPAT_H */
+KSU419HDR
+        fi
+        for f in feature/sucompat.c runtime/ksud_integration.c sulog/event.c \
+                 hook/arm64/patch_memory.c hook/x86_64/patch_memory.c; do
+            if ! grep -q 'ksu_419_compat.h' "$KSUK/$f"; then
+                sed -i '0,/^[[:space:]]*#include "/{s/^[[:space:]]*#include "/#include "ksu_419_compat.h"\n&/}' "$KSUK/$f"
+            fi
+        done
+        sed -i 's/\bstrncpy_from_user_nofault(/ksu_strncpy_from_user_nofault(/g' \
+            "$KSUK/feature/sucompat.c" "$KSUK/runtime/ksud_integration.c" "$KSUK/sulog/event.c"
+        sed -i 's/\bcopy_to_user_nofault(/ksu_copy_to_user_nofault(/g' "$KSUK/runtime/ksud_integration.c"
+        # t31/F1: both patch_memory.c files call copy_to_kernel_nofault(); only the
+        # arm64 one is compiled here, but renaming both keeps the gate below strict.
+        sed -i 's/\bcopy_to_kernel_nofault(/ksu_copy_to_kernel_nofault(/g' \
+            "$KSUK/hook/arm64/patch_memory.c" "$KSUK/hook/x86_64/patch_memory.c"
+        # traps: a leftover bare 5.8 call, or a missing shim, must fail the build
+        for shim in ksu_strncpy_from_user_nofault ksu_copy_to_user_nofault ksu_copy_to_kernel_nofault; do
+            if ! grep -q "$shim" "$KSUK/include/ksu_419_compat.h"; then
+                echo "FATAL: [include/ksu_419_compat.h] has no $shim shim."
+                exit 1
+            fi
+        done
+        for sym in strncpy_from_user_nofault copy_to_user_nofault copy_to_kernel_nofault; do
+            if grep -rEl "(^|[^_a-zA-Z0-9])$sym[[:space:]]*\(" "$KSUK" --include='*.c' --include='*.h' | grep -qv 'ksu_419_compat.h'; then
+                echo "FATAL: a bare $sym() call (5.8+ API) is left in the 4.x KernelSU tree."
+                exit 1
+            fi
+        done
+        for f in feature/sucompat.c runtime/ksud_integration.c sulog/event.c \
+                 hook/arm64/patch_memory.c hook/x86_64/patch_memory.c; do
+            if ! grep -q 'ksu_419_compat.h' "$KSUK/$f"; then
+                echo "FATAL: [$f] does not include ksu_419_compat.h (it calls a 5.8+ maccess wrapper)."
+                exit 1
+            fi
+        done
+        # t31/F3: counts are grepped at run time, never hard-coded, so the line keeps
+        # matching reality when call sites are added or removed upstream.
+        cnt_strncpy=$(grep -rhoE '(^|[^_a-zA-Z0-9])ksu_strncpy_from_user_nofault[[:space:]]*\(' "$KSUK" --include='*.c' | wc -l)
+        cnt_to_user=$(grep -rhoE '(^|[^_a-zA-Z0-9])ksu_copy_to_user_nofault[[:space:]]*\(' "$KSUK" --include='*.c' | wc -l)
+        cnt_to_kern=$(grep -rhoE '(^|[^_a-zA-Z0-9])ksu_copy_to_kernel_nofault[[:space:]]*\(' "$KSUK" --include='*.c' | wc -l)
+        if [ "$cnt_strncpy" -eq 0 ] || [ "$cnt_to_user" -eq 0 ] || [ "$cnt_to_kern" -eq 0 ]; then
+            echo "FATAL: a 5.8+ maccess call site was not rewritten (counts: $cnt_strncpy/$cnt_to_user/$cnt_to_kern)."
+            exit 1
+        fi
+        echo "4.19 maccess shims applied: strncpy_from_user_nofault, copy_to_user_nofault, copy_to_kernel_nofault (rewritten call sites: $cnt_strncpy/$cnt_to_user/$cnt_to_kern)."
+
+        # t28b: infra/file_wrapper.c (compile list Kbuild:20, unconditional) pokes at
+        # two struct file_operations members 4.19 does not have - remap_file_range
+        # (4.20+) and iopoll (6.1+) - with no version guard at all, so the A line
+        # would die on them right after the maccess errors. Wrap them in the tree's
+        # usual version guards (the wrapped fops simply lose those two hooks on 4.19).
+        FW="$KSUK/infra/file_wrapper.c"
+        # t31/F2b: the guard MUST compare at the 5.0 boundary, not at 4.20:
+        # KERNEL_VERSION(4,19,325) = 267333 > KERNEL_VERSION(4,20,0) = 267264, so
+        # `>= KERNEL_VERSION(4,20,0)` is TRUE on this tree (the 325 patchlevel
+        # overflows into the minor nibble) and would have left the fix ineffective.
+        # KERNEL_VERSION(5,0,0) = 327680 is safely above it.
+        if ! grep -q 't28: remap_file_range fn is 5.0+' "$FW"; then
+            sed -i 's|^static loff_t ksu_wrapper_remap_file_range(|#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) /* t28: remap_file_range fn is 5.0+ */\nstatic loff_t ksu_wrapper_remap_file_range(|' "$FW"
+            sed -i 's|^static int ksu_wrapper_fadvise(|#endif /* t28: remap_file_range fn */\nstatic int ksu_wrapper_fadvise(|' "$FW"
+            sed -i 's|^    p->ops.remap_file_range = |#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) /* t28: remap_file_range op is 5.0+ */\n    p->ops.remap_file_range = |' "$FW"
+            sed -i 's|^\(    p->ops.remap_file_range = .*\)$|\1\n#endif /* t28: remap_file_range op */|' "$FW"
+            sed -i 's|^    p->ops.iopoll = |#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0) /* t28: iopoll op is 6.1+ */\n    p->ops.iopoll = |' "$FW"
+            sed -i 's|^\(    p->ops.iopoll = .*\)$|\1\n#endif /* t28: iopoll op */|' "$FW"
+            # t31/F2: guarding only the assignment was not enough - the 2-arg
+            # ksu_wrapper_iopoll() lives in the `#else` of the `#if >= 6.1` block,
+            # so it stayed compiled on 4.19 and still dereferenced f_op->iopoll.
+            # Making that branch require 6.1 as well removes it from 4.19 while
+            # keeping >= 6.1 behaviour byte-for-byte identical (the `#if` branch wins).
+            sed -i '/^static int ksu_wrapper_iopoll(struct kiocb \*kiocb, struct io_comp_batch \*icb, unsigned int v)$/,/^#endif$/s|^#else$|#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0) /* t31: iopoll member is 6.1+ */|' "$FW"
+        fi
+        for m in 'remap_file_range fn is 5.0+' 'remap_file_range op is 5.0+' 'iopoll op is 6.1+'; do
+            if ! grep -q "t28: $m" "$FW"; then
+                echo "FATAL: [infra/file_wrapper.c] guard for '$m' was not inserted."
+                exit 1
+            fi
+        done
+        for m in 'remap_file_range fn' 'remap_file_range op' 'iopoll op'; do
+            if [ "$(grep -c "t28: $m \*/" "$FW" || true)" -ne 1 ]; then
+                echo "FATAL: [infra/file_wrapper.c] the '#endif /* t28: $m */' terminator is missing or duplicated."
+                exit 1
+            fi
+        done
+        if ! grep -q 't31: iopoll member is 6.1+' "$FW"; then
+            echo "FATAL: [infra/file_wrapper.c] the 2-arg ksu_wrapper_iopoll() branch is still compiled on 4.19."
+            exit 1
+        fi
+        echo "4.19 fop guards applied: file_wrapper.c remap_file_range (4.20+ member, guarded at the 5.0 boundary) and iopoll (6.1+), incl. the 2-arg wrapper branch."
+    else
+        echo "NOTE: KernelSU/kernel/feature/sucompat.c not present (3.x SUSFS tree) - the 5.8+ maccess shims are not needed."
+    fi
+
     if [ "$WITH_SUSFS" -eq 1 ]; then
         # Without the SUSFS glue in the KernelSU tree the SUSFS line would only
         # look like SUSFS: fail loudly instead of producing a fake kernel.
