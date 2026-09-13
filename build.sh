@@ -537,6 +537,50 @@ KSU419HDR
             exit 1
         fi
         echo "4.19 fop guards applied: file_wrapper.c remap_file_range (4.20+ member, guarded at the 5.0 boundary) and iopoll (6.1+), incl. the 2-arg wrapper branch."
+
+        # t35/A1: security_inode_init_security_anon() is 5.5+, and this 4.19 tree has
+        # no such LSM hook (include/linux/security.h carries only
+        # security_inode_init_security at :282 and a no-op variant at :651). The call
+        # sits in the pre-5.16 fallback of ksu_anon_inode_make_secure_inode(), and that
+        # fallback IS reachable here: ksu_file_wrapper_init() fills anon_inode_mnt under
+        # `#if < 5.16` (file_wrapper.c:574) and is called from core/init.c:172/191, so
+        # anon_inode_mnt is not permanently NULL. We therefore skip only the hook
+        # instead of deleting the fallback: the wrapper inode keeps the default SELinux
+        # blob, and ksu_install_file_wrapper() sets its sid directly from ksu_file_sid
+        # (file_wrapper.c:526-531). `error = 0` keeps that variable initialized for the
+        # `if (error)` check that follows.
+        if ! grep -q 't35: no anon-inode LSM hook before 5.5' "$FW"; then
+            sed -i 's|^\(    \)error = security_inode_init_security_anon(inode, &qname, context_inode);$|\1/* t35: no anon-inode LSM hook before 5.5 - security_inode_init_security_anon()\n\1 * does not exist in this 4.19 tree. Skipping it is safe: the wrapper inode keeps\n\1 * the default SELinux blob and ksu_install_file_wrapper() assigns its sid from\n\1 * ksu_file_sid directly. */\n\1#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0)\n\1error = security_inode_init_security_anon(inode, \&qname, context_inode);\n\1#else\n\1error = 0; /* t35: no anon-inode LSM hook before 5.5 */\n\1#endif|' "$FW"
+        fi
+        # t35/A2: selinux_inode() is 5.9+ (security/selinux/include/objsec.h). This tree
+        # declares struct inode_security_struct in objsec.h:57 and defines its own
+        # inode_security() accessor in security/selinux/hooks.c:326-330 as a *static
+        # inline* that just returns inode->i_security (struct inode field: fs.h:636), so
+        # the 4.19 equivalent of selinux_inode(inode) is that cast.
+        if ! grep -q 't35: selinux_inode is 5.9+' "$FW"; then
+            sed -i 's|\bselinux_inode(wrapper_inode)|(struct inode_security_struct *)wrapper_inode->i_security /* t35: selinux_inode is 5.9+; 4.19 uses inode->i_security */|' "$FW"
+        fi
+        if ! grep -q 't35: no anon-inode LSM hook before 5.5' "$FW"; then
+            echo "FATAL: [infra/file_wrapper.c] security_inode_init_security_anon() is still unguarded."
+            exit 1
+        fi
+        if ! grep -q 'error = 0; /\* t35: no anon-inode LSM hook before 5.5 \*/' "$FW"; then
+            echo "FATAL: [infra/file_wrapper.c] the pre-5.5 branch does not initialise 'error'."
+            exit 1
+        fi
+        if ! awk '/t35: no anon-inode LSM hook before 5.5/{f=1} f && /#if LINUX_VERSION_CODE >= KERNEL_VERSION\(5, 5, 0\)/{print "ok"; exit}' "$FW" | grep -q ok; then
+            echo "FATAL: [infra/file_wrapper.c] the anon-inode LSM hook is not wrapped in the 5.5 guard."
+            exit 1
+        fi
+        if grep -qE '(^|[^_a-zA-Z0-9])selinux_inode[[:space:]]*\(' "$FW"; then
+            echo "FATAL: [infra/file_wrapper.c] a bare selinux_inode() call (5.9+ accessor) is left."
+            exit 1
+        fi
+        if ! grep -q 't35: selinux_inode is 5.9+' "$FW"; then
+            echo "FATAL: [infra/file_wrapper.c] the selinux_inode() call was not replaced."
+            exit 1
+        fi
+        echo "4.19 selinux shims applied: file_wrapper.c anon-inode hook guarded at 5.5, selinux_inode() -> inode->i_security."
     else
         echo "NOTE: KernelSU/kernel/feature/sucompat.c not present (3.x SUSFS tree) - the 5.8+ maccess shims are not needed."
     fi
@@ -634,7 +678,15 @@ else
     scripts/config --file out/.config -d KSU
 fi
 
-make $MAKE_ARGS -j$(nproc)
+# t35/B: -k (keep going) so that one run reports *every* error. kbuild builds
+# `kernelsu-objs` (= KSU) as a single composite object and stops scheduling new
+# members as soon as one fails, which is why five runs in a row each exposed only
+# 1-2 errors while 20+ KSU translation units were never compiled at all. With -k
+# all independent TUs still get compiled and the full error list comes out in one
+# go. It has no effect on a successful build; a failing run is expected to take
+# longer and produce a bigger log - that is not a regression. It does NOT make a
+# failing build pass.
+make $MAKE_ARGS -j$(nproc) -k
 
 
 if [ -f "out/arch/arm64/boot/Image" ]; then
@@ -871,7 +923,10 @@ if [ $KSU_ENABLE -eq 1 ]; then
     fi
 fi
 
-make $MAKE_ARGS -j$(nproc)
+# t35/B: -k, see the note on the AOSP compile above. This is the compile the CI
+# actually runs (every job pins MIUI_ONLY=1, so this MIUI block is the one that
+# decides A line / B line), hence the -k that matters for the next run is here.
+make $MAKE_ARGS -j$(nproc) -k
 
 
 
