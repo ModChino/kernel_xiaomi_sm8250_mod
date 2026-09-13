@@ -261,6 +261,37 @@ if [ $KSU_ENABLE -eq 1 ]; then
         echo "NOTE: KernelSU/kernel/Kbuild not present (3.x SUSFS tree) - the security/selinux/ss include is not needed there."
     fi
 
+    # t20: 4.19 has no MODULE_IMPORT_NS (it arrives with 5.16) while SukiSU v4.2.0's
+    # kernel/core/init.c calls it in both branches of a >=6.13 guard. On 4.19 the
+    # preprocessor leaves the token in place, clang reads it as an untyped function
+    # definition and -Werror turns that into a hard error:
+    #   kernel/core/init.c:244:1: error: type specifier missing, defaults to 'int'
+    # Replace that guard block with a no-op definition and drop the two call lines
+    # (expanding a no-op macro while keeping a call would leave a bare ';' at file
+    # scope, which -Werror can also reject). Only the 4.x trees carry this file -
+    # the 3.x SUSFS line does not, so the whole block is skipped there (an
+    # unconditional sed would abort the script under `set -e`).
+    if [ -f KernelSU/kernel/core/init.c ]; then
+        if ! grep -q '^#ifndef MODULE_IMPORT_NS$' KernelSU/kernel/core/init.c; then
+            sed -i '/^#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)$/,/^#endif$/{
+                s|^#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)$|#ifndef MODULE_IMPORT_NS\n#define MODULE_IMPORT_NS(x)|
+                /^[[:space:]]*MODULE_IMPORT_NS(/d
+                /^#else$/d
+            }' KernelSU/kernel/core/init.c
+        fi
+        if ! grep -q '^#define MODULE_IMPORT_NS' KernelSU/kernel/core/init.c; then
+            echo "FATAL: [KernelSU/kernel/core/init.c] has no MODULE_IMPORT_NS definition."
+            exit 1
+        fi
+        if grep -q '^[[:space:]]*MODULE_IMPORT_NS(' KernelSU/kernel/core/init.c; then
+            echo "FATAL: [KernelSU/kernel/core/init.c] still calls MODULE_IMPORT_NS (bare ';' at file scope under -Werror)."
+            exit 1
+        fi
+        echo "KernelSU/kernel/core/init.c: MODULE_IMPORT_NS no-op in place, both calls removed."
+    else
+        echo "NOTE: KernelSU/kernel/core/init.c not present (3.x SUSFS tree) - the MODULE_IMPORT_NS compat patch is not needed."
+    fi
+
     if [ "$WITH_SUSFS" -eq 1 ]; then
         # Without the SUSFS glue in the KernelSU tree the SUSFS line would only
         # look like SUSFS: fail loudly instead of producing a fake kernel.
