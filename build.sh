@@ -292,6 +292,87 @@ if [ $KSU_ENABLE -eq 1 ]; then
         echo "NOTE: KernelSU/kernel/core/init.c not present (3.x SUSFS tree) - the MODULE_IMPORT_NS compat patch is not needed."
     fi
 
+    # t24: 4.19 API/header sweep, see enuma_kernel_build/KSU-4.19-COMPAT-SWEEP.md.
+    # Four mechanical fixes plus a runtime-resolved path_mount(). Each fix is
+    # guarded by its own grep, so re-running the script is a no-op; the traps at
+    # the end turn a missed fix into a hard failure instead of another ~21 minute
+    # build cycle. Only the 4.x trees carry these files, so the 3.x SUSFS line
+    # skips the whole block (an unconditional sed would abort under `set -e`).
+    if [ -f KernelSU/kernel/feature/sucompat.c ]; then
+        KSUK=KernelSU/kernel
+        # (1) linux/pgtable.h (5.11+): sucompat.c uses no pgtable symbol at all
+        if grep -q '#include <linux/pgtable.h>' "$KSUK/feature/sucompat.c"; then
+            sed -i '/#include <linux\/pgtable.h>/d' "$KSUK/feature/sucompat.c"
+        fi
+        # (2) linux/minmax.h (5.10+): min()/max() live in linux/kernel.h on 4.19
+        sed -i 's|#include <linux/minmax.h>|#include <linux/kernel.h>|' "$KSUK/sulog/event.c"
+        # (3) uapi/linux/mount.h (5.2+): MS_PRIVATE/MS_REC are in uapi/linux/fs.h
+        sed -i 's|#include <uapi/linux/mount.h>|#include <linux/fs.h>|' "$KSUK/infra/su_mount_ns.c"
+        # (4) TWA_RESUME (5.9+): 4.19 task_work_add() takes a plain bool
+        sed -i 's/\bTWA_RESUME\b/true/g' "$KSUK/policy/allowlist.c" "$KSUK/supercall/supercall.c"
+        # (5) path_mount() (5.2+): resolve at runtime, degrade with one clear log line
+        if ! grep -q 't24: path_mount runtime resolve' "$KSUK/infra/su_mount_ns.c"; then
+            sed -i 's|^#include "infra/su_mount_ns.h"$|#include "infra/su_mount_ns.h"\n#include "infra/symbol_resolver.h" /* t24 */|' "$KSUK/infra/su_mount_ns.c"
+            sed -i 's|^extern int path_mount(.*$|/* t24: path_mount() is 5.2+ only; the wrapper below resolves it at runtime */|' "$KSUK/infra/su_mount_ns.c"
+            sed -i 's|^[[:space:]]*void \*data_page);$|static int ksu_path_mount_compat(const char *dev_name, struct path *path, const char *type_page, unsigned long flags, void *data_page);|' "$KSUK/infra/su_mount_ns.c"
+            sed -i 's#\bpath_mount(NULL, &root_path, NULL, MS_PRIVATE | MS_REC, NULL)#ksu_path_mount_compat(NULL, \&root_path, NULL, MS_PRIVATE | MS_REC, NULL)#' "$KSUK/infra/su_mount_ns.c"
+            cat >> "$KSUK/infra/su_mount_ns.c" <<'KSU419EOF'
+
+/* t24: path_mount runtime resolve (Linux 4.19 has no path_mount(); it is 5.2+).
+ * The symbol is looked up with the existing kallsyms resolver; when it is absent
+ * one explicit line is logged and the caller sees -ENOSYS.
+ * Consequence: on a kernel without path_mount() the mount-propagation step is
+ * skipped (feature degradation, documented in the delivery notes). */
+static int (*ksu_path_mount_fn)(const char *dev_name, struct path *path,
+                                const char *type_page, unsigned long flags, void *data_page);
+static bool ksu_path_mount_warned;
+
+static int ksu_path_mount_compat(const char *dev_name, struct path *path,
+                                 const char *type_page, unsigned long flags, void *data_page)
+{
+    if (!ksu_path_mount_fn)
+        ksu_path_mount_fn = (void *)ksu_resolve_symbol_for_functable_hook("path_mount");
+    if (!ksu_path_mount_fn) {
+        if (!ksu_path_mount_warned) {
+            pr_warn("t24: path_mount() is not available on this kernel (pre-5.2) - mount propagation setup skipped\n");
+            ksu_path_mount_warned = true;
+        }
+        return -ENOSYS;
+    }
+    return ksu_path_mount_fn(dev_name, path, type_page, flags, data_page);
+}
+KSU419EOF
+        fi
+        # traps: any residue means the sweep did not land -> fail loudly
+        if grep -q '#include <linux/pgtable.h>' "$KSUK/feature/sucompat.c"; then
+            echo "FATAL: [feature/sucompat.c] still includes <linux/pgtable.h> (5.11+ header)."
+            exit 1
+        fi
+        if grep -q '#include <linux/minmax.h>' "$KSUK/sulog/event.c"; then
+            echo "FATAL: [sulog/event.c] still includes <linux/minmax.h> (5.10+ header)."
+            exit 1
+        fi
+        if grep -q '#include <uapi/linux/mount.h>' "$KSUK/infra/su_mount_ns.c"; then
+            echo "FATAL: [infra/su_mount_ns.c] still includes <uapi/linux/mount.h> (5.2+ header)."
+            exit 1
+        fi
+        if grep -rq '\bTWA_RESUME\b' "$KSUK"; then
+            echo "FATAL: TWA_RESUME (5.9+ enum) is still present in the 4.x KernelSU tree."
+            exit 1
+        fi
+        if grep -q '^extern int path_mount(' "$KSUK/infra/su_mount_ns.c"; then
+            echo "FATAL: [infra/su_mount_ns.c] still declares extern path_mount()."
+            exit 1
+        fi
+        if ! grep -q 'ksu_path_mount_compat' "$KSUK/infra/su_mount_ns.c"; then
+            echo "FATAL: [infra/su_mount_ns.c] has no ksu_path_mount_compat wrapper."
+            exit 1
+        fi
+        echo "4.19 compat sweep applied: pgtable/minmax/uapi-mount headers, TWA_RESUME, path_mount runtime resolve."
+    else
+        echo "NOTE: KernelSU/kernel/feature/sucompat.c not present (3.x SUSFS tree) - the 4.19 compat sweep is not needed."
+    fi
+
     if [ "$WITH_SUSFS" -eq 1 ]; then
         # Without the SUSFS glue in the KernelSU tree the SUSFS line would only
         # look like SUSFS: fail loudly instead of producing a fake kernel.
