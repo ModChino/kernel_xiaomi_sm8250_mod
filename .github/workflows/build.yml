@@ -111,7 +111,32 @@ jobs:
         run: |
           set -o pipefail
           echo "TOOLCHAIN_PATH=$TOOLCHAIN_PATH"
-          bash build.sh "${{ inputs.device }}" ksu 2>&1 | tee build-susfs${{ matrix.susfs }}.log
+          RAW=build-susfs${{ matrix.susfs }}.raw.log
+          LOG=build-susfs${{ matrix.susfs }}.log
+          # t40/P2-b: clang 17 emits DWARF 5, whose DW_FORM_loclistx (0x22) and
+          # DW_FORM_rnglistx (0x23) are unknown to ubuntu-22.04's objdump; it then
+          # prints one warning per occurrence (456894 of 464774 A-line log lines in
+          # run5 - 98.3%). build.sh also passes -gdwarf-4 now, so this filter is the
+          # safety net for whatever remains. The rc is captured (not propagated by
+          # `set -e` when it is assigned via `||`) so that both logs always exist,
+          # and `exit $rc` preserves exactly today's step result.
+          rc=0
+          bash build.sh "${{ inputs.device }}" ksu 2>&1 | tee "$RAW" || rc=$?
+          awk -v out="$LOG" '
+            /objdump: Warning: Unrecognized form: 0x[0-9a-fA-F][0-9a-fA-F]+/ { c1++; if (c1 <= 2) s1 = s1 "\n" $0; next }
+            /objdump: Warning: Bogus end-of-siblings marker detected/ { c2++; if (c2 <= 2) s2 = s2 "\n" $0; next }
+            /objdump: Warning: Further warnings about bogus end-of-sibling markers suppressed/ { c3++; if (c3 <= 2) s3 = s3 "\n" $0; next }
+            { print > out }
+            END {
+              printf "[log-filter] suppressed %d x \"objdump: Warning: Unrecognized form\" / %d x \"Bogus end-of-siblings\" / %d x \"Further warnings about bogus end-of-sibling markers suppressed\"\n", c1, c2, c3;
+              print "[log-filter] sample class 1 (Unrecognized form):" s1;
+              print "[log-filter] sample class 2 (Bogus end-of-siblings):" s2;
+              print "[log-filter] sample class 3 (suppressed-notice):" s3;
+              printf "[log-filter] kept %d lines, dropped %d of %d\n", NR - c1 - c2 - c3, c1 + c2 + c3, NR;
+            }' "$RAW" | tee -a "$LOG" || cp "$RAW" "$LOG"
+          gzip -9 -c "$RAW" > "$RAW.gz" || true
+          ls -l "$LOG" "$RAW" "$RAW.gz" || true
+          exit $rc
 
       - name: Upload kernel zip
         if: always()
@@ -123,6 +148,16 @@ jobs:
           # artifact can never contain the other line's zip.
           path: Kernel_MIUI_enuma_SukiSU${{ matrix.susfs == 1 && '-SUSFS' || '' }}_*.zip
           if-no-files-found: ${{ matrix.susfs == 0 && 'error' || 'ignore' }}
+
+      - name: Upload raw build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # t40/P2-b: the unfiltered log, gzipped (an order of magnitude smaller),
+          # so the filtered view never silently loses information.
+          name: build-log-raw-susfs${{ matrix.susfs }}
+          path: build-susfs${{ matrix.susfs }}.raw.log.gz
+          if-no-files-found: warn
 
       - name: Upload build log
         if: always()
