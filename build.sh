@@ -139,6 +139,26 @@ echo "CCACHE_DIR: [$CCACHE_DIR]"
 
 MAKE_ARGS="ARCH=arm64 SUBARCH=arm64 O=out CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
 
+# t40/Part1+P2-a: exported (not in MAKE_ARGS, which is expanded unquoted and
+# would split a multi-word value into separate make goals).
+#   -gdwarf-4       : clang 17 defaults to DWARF 5, whose DW_FORM_loclistx (0x22)
+#                     and DW_FORM_rnglistx (0x23) make ubuntu-22.04's
+#                     aarch64-linux-gnu-objdump (binutils 2.38) print one warning
+#                     per occurrence - 98.3% of the A line log. kbuild appends
+#                     KCFLAGS/KAFLAGS *after* KBUILD_CFLAGS/KBUILD_AFLAGS
+#                     (Makefile:1001/1002), so this overrides clang's default.
+#                     The flashed Image is produced by arch/arm64/boot/Makefile:19
+#                     `OBJCOPYFLAGS_Image := -O binary -R .note -R .note.gnu.build-id
+#                     -R .comment -S`, i.e. objcopy -O binary keeps only allocatable
+#                     sections (debug sections are non-alloc) and -S strips symbols,
+#                     so the debug format cannot reach the flashed Image.
+#   -ferror-limit=0 : clang stops after 20 diagnostics per TU, which truncated two
+#                     KSU objects in run6 ("too many errors emitted"). This only
+#                     raises a *diagnostic* cap; it changes no code generation and
+#                     silences no warning class.
+export KCFLAGS="-gdwarf-4 -ferror-limit=0"
+export KAFLAGS="-gdwarf-4"
+
 
 if [ "$1" == "j1" ]; then
     make $MAKE_ARGS -j1
@@ -385,7 +405,7 @@ KSU419EOF
     # shimmed here. The user-space strncpy shim mirrors mainline v5.8 mm/maccess.c.
     if [ -f KernelSU/kernel/feature/sucompat.c ]; then
         KSUK=KernelSU/kernel
-        if ! grep -qs 'ksu_copy_to_kernel_nofault' "$KSUK/include/ksu_419_compat.h"; then
+        if ! grep -qs 'ksu_copy_from_user_nofault' "$KSUK/include/ksu_419_compat.h"; then
             cat > "$KSUK/include/ksu_419_compat.h" <<'KSU419HDR'
 /* t28: Linux 4.19 compatibility shims for the 5.8+ "maccess" wrappers used by
  * KernelSU v4.2.0. Included from every file that calls one of them. */
@@ -446,6 +466,14 @@ static inline long ksu_copy_to_kernel_nofault(void *dst, const void *src, size_t
 {
     return probe_kernel_write(dst, src, size);
 }
+
+/* t40: copy_from_user_nofault() has no declaration anywhere in this 4.19 tree
+ * (include/linux/uaccess.h: 0 hits - verified); the pre-5.8 spelling is
+ * probe_user_read(), same contract (bytes not copied, 0 on success). */
+static inline long ksu_copy_from_user_nofault(void *dst, const void __user *src, size_t size)
+{
+    return probe_user_read(dst, src, size);
+}
 #endif /* LINUX_VERSION_CODE < 5.8 */
 
 #endif /* __KSU_419_COMPAT_H */
@@ -464,14 +492,22 @@ KSU419HDR
         # arm64 one is compiled here, but renaming both keeps the gate below strict.
         sed -i 's/\bcopy_to_kernel_nofault(/ksu_copy_to_kernel_nofault(/g' \
             "$KSUK/hook/arm64/patch_memory.c" "$KSUK/hook/x86_64/patch_memory.c"
+        # t40: copy_from_user_nofault() is declared nowhere in this 4.19 tree, so the
+        # two call sites move to the fourth compat shim as well (kernel_compat.h is
+        # dead code today but is kept consistent).
+        sed -i 's/\bcopy_from_user_nofault(/ksu_copy_from_user_nofault(/g' \
+            "$KSUK/runtime/ksud_integration.c" "$KSUK/kernel_compat.h"
+        if ! grep -q 'ksu_419_compat.h' "$KSUK/kernel_compat.h"; then
+            sed -i 's|^#include <linux/fs.h>|#include <linux/fs.h>\n#include "ksu_419_compat.h" /* t40 */|' "$KSUK/kernel_compat.h"
+        fi
         # traps: a leftover bare 5.8 call, or a missing shim, must fail the build
-        for shim in ksu_strncpy_from_user_nofault ksu_copy_to_user_nofault ksu_copy_to_kernel_nofault; do
+        for shim in ksu_strncpy_from_user_nofault ksu_copy_to_user_nofault ksu_copy_to_kernel_nofault ksu_copy_from_user_nofault; do
             if ! grep -q "$shim" "$KSUK/include/ksu_419_compat.h"; then
                 echo "FATAL: [include/ksu_419_compat.h] has no $shim shim."
                 exit 1
             fi
         done
-        for sym in strncpy_from_user_nofault copy_to_user_nofault copy_to_kernel_nofault; do
+        for sym in strncpy_from_user_nofault copy_to_user_nofault copy_to_kernel_nofault copy_from_user_nofault; do
             if grep -rEl "(^|[^_a-zA-Z0-9])$sym[[:space:]]*\(" "$KSUK" --include='*.c' --include='*.h' | grep -qv 'ksu_419_compat.h'; then
                 echo "FATAL: a bare $sym() call (5.8+ API) is left in the 4.x KernelSU tree."
                 exit 1
@@ -489,11 +525,12 @@ KSU419HDR
         cnt_strncpy=$(grep -rhoE '(^|[^_a-zA-Z0-9])ksu_strncpy_from_user_nofault[[:space:]]*\(' "$KSUK" --include='*.c' | wc -l)
         cnt_to_user=$(grep -rhoE '(^|[^_a-zA-Z0-9])ksu_copy_to_user_nofault[[:space:]]*\(' "$KSUK" --include='*.c' | wc -l)
         cnt_to_kern=$(grep -rhoE '(^|[^_a-zA-Z0-9])ksu_copy_to_kernel_nofault[[:space:]]*\(' "$KSUK" --include='*.c' | wc -l)
-        if [ "$cnt_strncpy" -eq 0 ] || [ "$cnt_to_user" -eq 0 ] || [ "$cnt_to_kern" -eq 0 ]; then
-            echo "FATAL: a 5.8+ maccess call site was not rewritten (counts: $cnt_strncpy/$cnt_to_user/$cnt_to_kern)."
+        cnt_from_user=$(grep -rhoE '(^|[^_a-zA-Z0-9])ksu_copy_from_user_nofault[[:space:]]*\(' "$KSUK" --include='*.c' --include='*.h' | wc -l)
+        if [ "$cnt_strncpy" -eq 0 ] || [ "$cnt_to_user" -eq 0 ] || [ "$cnt_to_kern" -eq 0 ] || [ "$cnt_from_user" -eq 0 ]; then
+            echo "FATAL: a 5.8+ maccess call site was not rewritten (counts: $cnt_strncpy/$cnt_to_user/$cnt_to_kern/$cnt_from_user)."
             exit 1
         fi
-        echo "4.19 maccess shims applied: strncpy_from_user_nofault, copy_to_user_nofault, copy_to_kernel_nofault (rewritten call sites: $cnt_strncpy/$cnt_to_user/$cnt_to_kern)."
+        echo "4.19 maccess shims applied: strncpy_from_user_nofault, copy_to_user_nofault, copy_to_kernel_nofault, copy_from_user_nofault (rewritten call sites: $cnt_strncpy/$cnt_to_user/$cnt_to_kern/$cnt_from_user)."
 
         # t28b: infra/file_wrapper.c (compile list Kbuild:20, unconditional) pokes at
         # two struct file_operations members 4.19 does not have - remap_file_range
@@ -550,7 +587,7 @@ KSU419HDR
         # (file_wrapper.c:526-531). `error = 0` keeps that variable initialized for the
         # `if (error)` check that follows.
         if ! grep -q 't35: no anon-inode LSM hook before 5.5' "$FW"; then
-            sed -i 's|^\(    \)error = security_inode_init_security_anon(inode, &qname, context_inode);$|\1/* t35: no anon-inode LSM hook before 5.5 - security_inode_init_security_anon()\n\1 * does not exist in this 4.19 tree. Skipping it is safe: the wrapper inode keeps\n\1 * the default SELinux blob and ksu_install_file_wrapper() assigns its sid from\n\1 * ksu_file_sid directly. */\n\1#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0)\n\1error = security_inode_init_security_anon(inode, \&qname, context_inode);\n\1#else\n\1error = 0; /* t35: no anon-inode LSM hook before 5.5 */\n\1#endif|' "$FW"
+            sed -i 's|^\(    \)error = security_inode_init_security_anon(inode, &qname, context_inode);$|\1/* t35: no anon-inode LSM hook before 5.5 - security_inode_init_security_anon()\n\1 * does not exist in this 4.19 tree. Skipping it is safe: the wrapper inode keeps\n\1 * the default SELinux blob and ksu_install_file_wrapper() assigns its sid from\n\1 * ksu_file_sid directly. */\n\1#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0)\n\1error = security_inode_init_security_anon(inode, \&qname, context_inode);\n\1#else\n\1error = 0; /* t35: no anon-inode LSM hook before 5.5 */\n\1(void)qname; /* t40: keep qname used when the hook above is compiled out */\n\1#endif|' "$FW"
         fi
         # t35/A2: selinux_inode() is 5.9+ (security/selinux/include/objsec.h). This tree
         # declares struct inode_security_struct in objsec.h:57 and defines its own
@@ -592,6 +629,335 @@ KSU419HDR
             echo "FATAL: KernelSU tree [$KSU_REF] has no SUSFS support (CONFIG_KSU_SUSFS is missing)."
             exit 1
         fi
+    fi
+
+    # t40/Part3: 4.x "core" line. Subsystems that only exist in 5.x kernels are
+    # turned into version-guarded, API-shaped *stubs*: the original body stays
+    # inside `#if LINUX_VERSION_CODE >= <ver>` and an `#else` branch with one
+    # stub per exported symbol is appended. The files are never deleted and the
+    # Kbuild is never touched, so every call site still links. Each stub warns
+    # once, and the resulting feature loss is listed in KSU-4.19-COMPAT-SWEEP2.md
+    # SS12. Guard boundaries: SELinux policy injection 5.5 (struct
+    # selinux_state.policy / status_lock / status_page, struct selinux_policy),
+    # seccomp arch cache 5.9 (struct seccomp.filter_count, SECCOMP_ARCH_NATIVE_NR),
+    # vdso clock spoof 5.2 (struct clocksource.vdso_clock_mode).
+    if [ -f KernelSU/kernel/selinux/selinux.c ]; then
+        KSUK=KernelSU/kernel
+
+
+        SEL="$KSUK/selinux/selinux.c"
+        if ! grep -q 't40: selinux stubs' "$SEL"; then
+            sed -i -e '1i /* t40: SELinux policy injection is a 5.5+ subsystem; on 4.19 every entry point below is a stub. */' -e '1i #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0) /* t40: selinux gate */' "$SEL"
+            cat >> "$SEL" <<'T40SELINUX'
+#else /* t40: selinux stubs */
+/* t40: 4.19 has no runtime SELinux policy injection (no struct selinux_state.policy,
+ * no struct selinux_policy, no status_lock/status_page). Every symbol this module
+ * exports to the rest of KernelSU is provided here with its exact signature so the
+ * links stay intact; each one warns once and then degrades. Feature loss: KernelSU
+ * cannot inject its SELinux rules/domain on this kernel, so su/file contexts are
+ * not set up (see KSU-4.19-COMPAT-SWEEP2.md SS12). */
+#include "selinux/selinux.h"
+#include "selinux/sepolicy.h"
+#include <linux/printk.h>
+#include <linux/err.h>
+#include <linux/cred.h>
+
+static void t40_warn_selinux(bool *flag, const char *what)
+{
+    if (!*flag) {
+        *flag = true;
+        pr_warn("ksu: %s needs a 5.5+ SELinux; disabled on this 4.19 kernel\n", what);
+    }
+}
+
+void setup_selinux(const char *policy, struct cred *cred) { static bool w; t40_warn_selinux(&w, "setup_selinux"); }
+void setenforce(bool enforce) { static bool w; t40_warn_selinux(&w, "setenforce"); }
+bool getenforce(void) { static bool w; t40_warn_selinux(&w, "getenforce"); return false; }
+void cache_sid(void) { static bool w; t40_warn_selinux(&w, "cache_sid"); }
+bool is_task_ksu_domain(const struct cred *cred) { static bool w; t40_warn_selinux(&w, "is_task_ksu_domain"); return false; }
+bool is_ksu_domain(void) { static bool w; t40_warn_selinux(&w, "is_ksu_domain"); return false; }
+bool is_zygote(const struct cred *cred) { static bool w; t40_warn_selinux(&w, "is_zygote"); return false; }
+bool is_init(const struct cred *cred) { static bool w; t40_warn_selinux(&w, "is_init"); return false; }
+void apply_kernelsu_rules(void) { static bool w; t40_warn_selinux(&w, "apply_kernelsu_rules"); }
+int handle_sepolicy(void __user *user_data, u64 data_len) { static bool w; t40_warn_selinux(&w, "handle_sepolicy"); return -EOPNOTSUPP; }
+void setup_ksu_cred(void) { static bool w; t40_warn_selinux(&w, "setup_ksu_cred"); }
+void escape_to_root_for_adb_root(void) { static bool w; t40_warn_selinux(&w, "escape_to_root_for_adb_root"); }
+
+/* The file-context sid lives here; 0 keeps the wrappers non-NULL and is only ever
+ * compared against an inode sid, never used to look anything up. */
+u32 ksu_file_sid;
+
+struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol) { static bool w; t40_warn_selinux(&w, "ksu_dup_sepolicy"); return ERR_PTR(-EOPNOTSUPP); }
+void ksu_destroy_sepolicy(struct selinux_policy *orig) { static bool w; t40_warn_selinux(&w, "ksu_destroy_sepolicy"); }
+bool ksu_type(struct policydb *db, const char *name, const char *attr) { static bool w; t40_warn_selinux(&w, "ksu_type"); return false; }
+bool ksu_attribute(struct policydb *db, const char *name) { static bool w; t40_warn_selinux(&w, "ksu_attribute"); return false; }
+bool ksu_permissive(struct policydb *db, const char *type) { static bool w; t40_warn_selinux(&w, "ksu_permissive"); return false; }
+bool ksu_enforce(struct policydb *db, const char *type) { static bool w; t40_warn_selinux(&w, "ksu_enforce"); return false; }
+bool ksu_typeattribute(struct policydb *db, const char *type, const char *attr) { static bool w; t40_warn_selinux(&w, "ksu_typeattribute"); return false; }
+bool ksu_exists(struct policydb *db, const char *type) { static bool w; t40_warn_selinux(&w, "ksu_exists"); return false; }
+bool ksu_allow(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *perm) { static bool w; t40_warn_selinux(&w, "ksu_allow"); return false; }
+bool ksu_deny(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *perm) { static bool w; t40_warn_selinux(&w, "ksu_deny"); return false; }
+bool ksu_auditallow(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *perm) { static bool w; t40_warn_selinux(&w, "ksu_auditallow"); return false; }
+bool ksu_dontaudit(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *perm) { static bool w; t40_warn_selinux(&w, "ksu_dontaudit"); return false; }
+bool ksu_allowxperm(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *range) { static bool w; t40_warn_selinux(&w, "ksu_allowxperm"); return false; }
+bool ksu_auditallowxperm(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *range) { static bool w; t40_warn_selinux(&w, "ksu_auditallowxperm"); return false; }
+bool ksu_dontauditxperm(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *range) { static bool w; t40_warn_selinux(&w, "ksu_dontauditxperm"); return false; }
+bool ksu_type_change(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *def) { static bool w; t40_warn_selinux(&w, "ksu_type_change"); return false; }
+bool ksu_type_member(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *def) { static bool w; t40_warn_selinux(&w, "ksu_type_member"); return false; }
+bool ksu_type_transition(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *def, const char *obj) { static bool w; t40_warn_selinux(&w, "ksu_type_transition"); return false; }
+bool ksu_genfscon(struct policydb *db, const char *fs_name, const char *path, const char *ctx) { static bool w; t40_warn_selinux(&w, "ksu_genfscon"); return false; }
+#endif /* t40: selinux end */
+T40SELINUX
+        fi
+        for f in "$KSUK/selinux/rules.c" "$KSUK/selinux/sepolicy.c"; do
+            if ! grep -q 't40: selinux-extra gate' "$f"; then
+                sed -i -e '1i /* t40: policy injection is 5.5+; every symbol this file exports is stubbed in selinux/selinux.c (empty stub branch on purpose, so nothing is defined twice). */' -e '1i #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0) /* t40: selinux-extra gate */' "$f"
+                printf '\n#else /* t40: selinux-extra stubs */\n/* no definitions here: the exported API is stubbed once, in selinux/selinux.c */\n#endif /* t40: selinux-extra end */\n' >> "$f"
+            fi
+            if [ "$(grep -c 't40: selinux-extra gate' "$f")" != "1" ] || [ "$(grep -c 't40: selinux-extra stubs' "$f")" != "1" ]; then
+                echo "FATAL: [$f] is not wrapped in the t40 selinux-extra version gate."
+                exit 1
+            fi
+        done
+
+        SHIDE="$KSUK/feature/selinux_hide.c"
+        if ! grep -q 't40: selinux_hide stubs' "$SHIDE"; then
+            sed -i -e '1i /* t40: SELinux status hiding is 5.5+; on 4.19 the feature degrades to no-op stubs. */' -e '1i #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0) /* t40: selinux_hide gate */' "$SHIDE"
+            cat >> "$SHIDE" <<'T40HIDE'
+#else /* t40: selinux_hide stubs */
+/* t40: the feature pokes struct selinux_state.status_lock/status_page/policy and
+ * struct selinux_policy, all of which are 5.5+ (run6: 15 errors). Feature loss:
+ * SELinux status/backup hiding is unavailable on 4.19. */
+#include <linux/printk.h>
+
+static void t40_warn_hide(const char *what)
+{
+    pr_warn("ksu: %s needs a 5.5+ SELinux; disabled on this 4.19 kernel\n", what);
+}
+
+void ksu_selinux_hide_init(void) { t40_warn_hide("ksu_selinux_hide_init"); }
+void ksu_selinux_hide_exit(void) { }
+void ksu_selinux_hide_drop_backup_if_unused(void) { }
+void ksu_selinux_hide_handle_second_stage(void) { }
+void ksu_selinux_hide_handle_post_fs_data(void) { }
+#endif /* t40: selinux_hide end */
+T40HIDE
+        fi
+        if [ "$(grep -c 't40: selinux_hide gate' "$SHIDE")" != "1" ] || [ "$(grep -c 't40: selinux_hide stubs' "$SHIDE")" != "1" ]; then
+            echo "FATAL: [$SHIDE] is not wrapped in the t40 selinux_hide version gate."
+            exit 1
+        fi
+
+        SCC="$KSUK/infra/seccomp_cache.c"
+        if ! grep -q 't40: seccomp_cache stubs' "$SCC"; then
+            sed -i -e '1i /* t40: the seccomp arch cache is 5.9+ (struct seccomp.filter_count, SECCOMP_ARCH_NATIVE_NR). */' -e '1i #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0) /* t40: seccomp_cache gate */' "$SCC"
+            cat >> "$SCC" <<'T40SECCOMP'
+#else /* t40: seccomp_cache stubs */
+/* t40: 4.19 has no struct seccomp.filter_count and no SECCOMP_ARCH_NATIVE_NR
+ * (run6: 3 errors). Feature loss: the seccomp fast-path cache is a no-op, so
+ * every seccomp filter is still evaluated (correct, just slower). */
+#include <linux/printk.h>
+#include <linux/seccomp.h>
+
+void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)
+{
+    static bool w;
+    if (!w) {
+        w = true;
+        pr_warn("ksu: seccomp cache needs a 5.9+ kernel; no-op on this 4.19 kernel\n");
+    }
+}
+
+void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
+{
+}
+#endif /* t40: seccomp_cache end */
+T40SECCOMP
+        fi
+        if [ "$(grep -c 't40: seccomp_cache gate' "$SCC")" != "1" ] || [ "$(grep -c 't40: seccomp_cache stubs' "$SCC")" != "1" ]; then
+            echo "FATAL: [$SCC] is not wrapped in the t40 seccomp_cache version gate."
+            exit 1
+        fi
+
+        CSP="$KSUK/feature/cpu_spoof.c"
+        if ! grep -q 't40: cpu_spoof stubs' "$CSP"; then
+            sed -i -e '1i /* t40: vdso clock spoofing needs struct clocksource.vdso_clock_mode (5.2+). */' -e '1i #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0) /* t40: cpu_spoof gate */' "$CSP"
+            cat >> "$CSP" <<'T40SPOOF'
+#else /* t40: cpu_spoof stubs */
+/* t40: struct clocksource has no vdso_clock_mode member before 5.2 (run6: 3
+ * errors). Feature loss: CPU spoofing still answers the cmd, but the vdso clock
+ * source cannot be rewritten, so the spoof is not effective. */
+#include "feature/cpu_spoof.h"
+#include <linux/printk.h>
+#include <linux/err.h>
+
+int ksu_set_spoof_cpu(const struct ksu_set_spoof_cpu_cmd *cmd)
+{
+    static bool w;
+    if (!w) {
+        w = true;
+        pr_warn("ksu: cpu spoof needs a 5.2+ kernel (clocksource.vdso_clock_mode); disabled on this 4.19 kernel\n");
+    }
+    return -EOPNOTSUPP;
+}
+#endif /* t40: cpu_spoof end */
+T40SPOOF
+        fi
+        if [ "$(grep -c 't40: cpu_spoof gate' "$CSP")" != "1" ] || [ "$(grep -c 't40: cpu_spoof stubs' "$CSP")" != "1" ]; then
+            echo "FATAL: [$CSP] is not wrapped in the t40 cpu_spoof version gate."
+            exit 1
+        fi
+        echo "4.19 5.x-feature stubs applied: selinux/{selinux,rules,sepolicy}.c (5.5), feature/selinux_hide.c (5.5), infra/seccomp_cache.c (5.9), feature/cpu_spoof.c (5.2)."
+
+        # t40/Part4: the misc errors from the run6 list, each with its 4.19 evidence.
+        # (a) copy_from_user_nofault() does not exist in this tree at all (verified:
+        #     include/linux/uaccess.h has 0 hits) - the t28 compat header gains a
+        #     fourth shim and the call sites are renamed; the positive line above
+        #     counts them at run time.
+        # (b) put_task_struct() is declared in include/linux/sched/task.h:96 on 4.19.
+        # (c) fallthrough is 5.4+; this tree has no __fallthrough either, so use the
+        #     4.19 idiom (a /* fall through */ comment) which satisfies
+        #     -Wimplicit-fallthrough.
+        # (d) fsnotify_ops.handle_inode_event is 5.9+; 4.19 only has handle_event with
+        #     the signature the compiler printed in run6 - adapt with a no-op.
+        # (e) tasklist_lock/init_task/task_pgrp/task_session: add the two headers that
+        #     carry them on 4.19 (sched/signal.h, init_task.h) plus explicit externs
+        #     for the two that no 4.19 header advertises to modules.
+        # (f) policies here lose the adb-root escape path's SELinux part; see SS12.
+        AL="$KSUK/policy/allowlist.c"
+        if ! grep -q 't40: put_task_struct' "$AL"; then
+            sed -i -e '1i #include <linux/sched/task.h> /* t40: put_task_struct (task.h:96 on 4.19) */' "$AL"
+            sed -i 's/^\([[:space:]]*\)fallthrough;$/\1\/* fall through *\/  \/* t40: fallthrough is 5.4+; 4.19 idiom *\//' "$AL"
+        fi
+        if ! grep -q 'sched/task.h' "$AL"; then
+            echo "FATAL: [$AL] does not include <linux/sched/task.h> (put_task_struct)."
+            exit 1
+        fi
+        PO="$KSUK/manager/pkg_observer.c"
+        if ! grep -q 't40: handle_inode_event' "$PO"; then
+            sed -i 's|^\([[:space:]]*\)\.handle_inode_event = |#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0) /* t40: handle_inode_event */\n\1.handle_inode_event = |' "$PO"
+            sed -i 's|^\([[:space:]]*\)\.handle_inode_event = \(.*\)$|\1.handle_inode_event = \2\n#else\n\1.handle_event = ksu_t40_handle_event_compat,\n#endif /* t40: handle_inode_event */|' "$PO"
+            sed -i 's|^static const struct fsnotify_ops|#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)\n/* t40: 4.19 has only handle_event; the observer degrades to a no-op. */\nstatic int ksu_t40_handle_event_compat(struct fsnotify_group *group, struct inode *inode, u32 mask,\n                                       const void *data, int data_type, const unsigned char *file_name,\n                                       u32 cookie, struct fsnotify_iter_info *iter_info)\n{\n    return 0;\n}\n#endif\nstatic const struct fsnotify_ops|' "$PO"
+        fi
+        if ! grep -q 't40: handle_inode_event' "$PO" || ! grep -q 'ksu_t40_handle_event_compat' "$PO"; then
+            echo "FATAL: [$PO] was not adapted to the 4.19 fsnotify_ops API."
+            exit 1
+        fi
+        DIS="$KSUK/supercall/dispatch.c"
+        if ! grep -q 't40: 4.19 task/sched includes' "$DIS"; then
+            printf '%s\n' \
+                '#include <linux/sched/signal.h> /* t40: 4.19 task/sched includes */' \
+                '#include <linux/init_task.h>' \
+                'extern rwlock_t tasklist_lock;      /* defined in kernel/fork.c; no 4.19 header advertises it */' \
+                'extern struct task_struct init_task; /* defined in init/init_task.c */' > "$DIS.t40"
+            cat "$DIS" >> "$DIS.t40"
+            mv "$DIS.t40" "$DIS"
+        fi
+        if ! grep -q 't40: 4.19 task/sched includes' "$DIS"; then
+            echo "FATAL: [$DIS] is missing the t40 task/sched includes."
+            exit 1
+        fi
+        echo "4.19 misc fixes applied: copy_from_user_nofault shim, put_task_struct include, fallthrough idiom, fsnotify handle_event adapter, task/sched includes."
+
+        # t43/F1: mechanical per-stub ARITY gate. A stub definition whose parameter
+        # list disagrees with the prototype visible in the same TU is a hard error
+        # (C11 6.7p4, "conflicting types"), which is exactly what happened with
+        # ksu_type_transition (5 params vs the 6 in sepolicy.h - the t40 stub moved
+        # rules.c's error into selinux.c). Eyeballing signatures has now produced
+        # four regressions (t29 F1, t31 F2#1/#2, t40 F1), so this is mechanical:
+        # every stubbed symbol's parameter count is compared against its header
+        # declaration, and any mismatch fails the build. HARD RULE: a stub signature
+        # must be character-for-character identical to its header declaration.
+        t43_arity() { # $1 = file to scan, $2 = symbol -> prints the parameter count
+            awk -v s="$2" '
+              { buf = buf " " $0 }
+              END {
+                n = length(buf); p = index(buf, s "(");
+                if (p == 0) { print "?"; exit }
+                j = p + length(s) + 1; depth = 1; args = "";
+                while (j <= n) {
+                  c = substr(buf, j, 1);
+                  if (c == "(") depth++;
+                  else if (c == ")") { depth--; if (depth == 0) break }
+                  args = args c; j++;
+                }
+                gsub(/^[ \t]+/, "", args); gsub(/[ \t]+$/, "", args);
+                if (args == "" || args == "void") { print 0; exit }
+                cnt = 1;
+                for (k = 1; k <= length(args); k++) if (substr(args, k, 1) == ",") cnt++;
+                print cnt;
+              }' "$1"
+        }
+        T43TMP=$(mktemp -d)
+        sed -n '/#else \/\* t40: selinux stubs \*\//,/#endif \/\* t40: selinux end \*\//p' "$SEL" > "$T43TMP/selinux.stubs"
+        sed -n '/#else \/\* t40: selinux_hide stubs \*\//,/#endif \/\* t40: selinux_hide end \*\//p' "$SHIDE" > "$T43TMP/hide.stubs"
+        sed -n '/#else \/\* t40: seccomp_cache stubs \*\//,/#endif \/\* t40: seccomp_cache end \*\//p' "$SCC" > "$T43TMP/seccomp.stubs"
+        sed -n '/#else \/\* t40: cpu_spoof stubs \*\//,/#endif \/\* t40: cpu_spoof end \*\//p' "$CSP" > "$T43TMP/spoof.stubs"
+        t43_bad=0
+        t43_n=0
+        while read -r t43_sym t43_hdr t43_stub; do
+            [ -n "${t43_sym:-}" ] || continue
+            t43_a=$(t43_arity "$KSUK/$t43_hdr" "$t43_sym")
+            t43_b=$(t43_arity "$T43TMP/$t43_stub" "$t43_sym")
+            t43_n=$((t43_n + 1))
+            printf '   [arity] %-34s header(%s)=%s stub=%s\n' "$t43_sym" "$t43_hdr" "$t43_a" "$t43_b"
+            if [ "$t43_a" != "$t43_b" ]; then
+                echo "FATAL: [t43] stub arity mismatch for $t43_sym: header($t43_hdr)=$t43_a, stub=$t43_b"
+                t43_bad=1
+            fi
+        done <<'T43LIST'
+setup_selinux selinux/selinux.h selinux.stubs
+setenforce selinux/selinux.h selinux.stubs
+getenforce selinux/selinux.h selinux.stubs
+cache_sid selinux/selinux.h selinux.stubs
+is_task_ksu_domain selinux/selinux.h selinux.stubs
+is_ksu_domain selinux/selinux.h selinux.stubs
+is_zygote selinux/selinux.h selinux.stubs
+is_init selinux/selinux.h selinux.stubs
+apply_kernelsu_rules selinux/selinux.h selinux.stubs
+handle_sepolicy selinux/selinux.h selinux.stubs
+setup_ksu_cred selinux/selinux.h selinux.stubs
+escape_to_root_for_adb_root selinux/selinux.h selinux.stubs
+ksu_dup_sepolicy selinux/sepolicy.h selinux.stubs
+ksu_destroy_sepolicy selinux/sepolicy.h selinux.stubs
+ksu_type selinux/sepolicy.h selinux.stubs
+ksu_attribute selinux/sepolicy.h selinux.stubs
+ksu_permissive selinux/sepolicy.h selinux.stubs
+ksu_enforce selinux/sepolicy.h selinux.stubs
+ksu_typeattribute selinux/sepolicy.h selinux.stubs
+ksu_exists selinux/sepolicy.h selinux.stubs
+ksu_allow selinux/sepolicy.h selinux.stubs
+ksu_deny selinux/sepolicy.h selinux.stubs
+ksu_auditallow selinux/sepolicy.h selinux.stubs
+ksu_dontaudit selinux/sepolicy.h selinux.stubs
+ksu_allowxperm selinux/sepolicy.h selinux.stubs
+ksu_auditallowxperm selinux/sepolicy.h selinux.stubs
+ksu_dontauditxperm selinux/sepolicy.h selinux.stubs
+ksu_type_transition selinux/sepolicy.h selinux.stubs
+ksu_type_change selinux/sepolicy.h selinux.stubs
+ksu_type_member selinux/sepolicy.h selinux.stubs
+ksu_genfscon selinux/sepolicy.h selinux.stubs
+ksu_selinux_hide_init feature/selinux_hide.h hide.stubs
+ksu_selinux_hide_exit feature/selinux_hide.h hide.stubs
+ksu_selinux_hide_drop_backup_if_unused feature/selinux_hide.h hide.stubs
+ksu_selinux_hide_handle_second_stage feature/selinux_hide.h hide.stubs
+ksu_selinux_hide_handle_post_fs_data feature/selinux_hide.h hide.stubs
+ksu_seccomp_clear_cache infra/seccomp_cache.h seccomp.stubs
+ksu_seccomp_allow_cache infra/seccomp_cache.h seccomp.stubs
+ksu_set_spoof_cpu feature/cpu_spoof.h spoof.stubs
+T43LIST
+        rm -rf "$T43TMP"
+        if [ "$t43_bad" != "0" ]; then
+            echo "FATAL: [t43] at least one t40 stub disagrees with its header prototype (see the [arity] lines above)."
+            exit 1
+        fi
+        if [ "$t43_n" != "39" ]; then
+            echo "FATAL: [t43] the arity gate only checked $t43_n stubs, expected 39."
+            exit 1
+        fi
+        echo "4.19 stub arity gate passed: $t43_n stubs match their header prototypes."
+    else
+        echo "NOTE: KernelSU/kernel/selinux/selinux.c not present (3.x SUSFS tree) - the t40 stubs are not needed."
     fi
 else
     echo "KSU is disabled"
