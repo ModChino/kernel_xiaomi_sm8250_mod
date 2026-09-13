@@ -53,7 +53,12 @@
 # Ensure the script exits on error
 set -e
 
-TOOLCHAIN_PATH=$HOME/proton-clang/proton-clang-20210522/bin
+# Toolchain: default stays the documented proton-clang 20210522 path, but the
+# variable is now overridable from the environment. The CI workflow passes the
+# AOSP clang r487747c prebuilt (Android (10087095, ...based on r487747c) clang
+# version 17.0.2), which is the compiler the last known-good released enuma
+# package was built with - see .github/workflows/build.yml.
+TOOLCHAIN_PATH=${TOOLCHAIN_PATH:-$HOME/proton-clang/proton-clang-20210522/bin}
 GIT_COMMIT_ID=$(git rev-parse --short=8 HEAD)
 TARGET_DEVICE=$1
 
@@ -298,7 +303,9 @@ echo "Building for AOSP......"
 make $MAKE_ARGS ${TARGET_DEVICE}_defconfig
 
 if [ $KSU_ENABLE -eq 1 ]; then
-    # KSU config block (AOSP): clean line = KSU + KPROBES + EXT4_FS + KPM,
+    # KSU config block (AOSP): clean line = KSU + KPROBES + EXT4_FS with KPM **off**
+    # (t17: KernelSU v4.2.0's kernel/kpm/kpm.c uses the 5.0+ two-argument
+    # access_ok() and does not compile on 4.19 - see the gate below),
     # SUSFS line = KSU + KSU_MANUAL_HOOK + KSU_SUSFS + KSU_SUSFS_* + KPM.
     if [ "$WITH_SUSFS" -eq 1 ]; then
         scripts/config --file out/.config \
@@ -326,20 +333,21 @@ if [ $KSU_ENABLE -eq 1 ]; then
         -e KSU \
         -e KPROBES \
         -e EXT4_FS \
-        -e KPM
+        -d KPM
     fi
 
     # scripts/config does not resolve dependencies: re-solve, then gate.
     make $MAKE_ARGS olddefconfig
 
     require_config KSU
-    require_config KPM
     if [ "$WITH_SUSFS" -eq 1 ]; then
+        require_config KPM
         require_config KSU_SUSFS
         forbid_config KSU_SUSFS_SUS_SU
     else
         require_config KPROBES
         require_config EXT4_FS
+        forbid_config KPM
         forbid_symbol KSU_MANUAL_HOOK
     fi
 else
@@ -364,9 +372,12 @@ rm -rf anykernel/kernels/
 mkdir -p anykernel/kernels/
 
 # Patch for SukiSU KPM support. 
-if [ $KSU_ENABLE -eq 1 ]; then
+if [ $KSU_ENABLE -eq 1 ] && [ "$WITH_SUSFS" -eq 1 ]; then
     cd out/arch/arm64/boot/
-    wget -q https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.13.0/patch_linux
+    # KPM image patch: SUSFS line only. The clean line builds with CONFIG_KPM=n
+    # (see the gates above), so patching its image would be meaningless.
+    # Version pinned to 0.12.0 = the release used by the last known-good package.
+    wget -q https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.0/patch_linux
     chmod +x patch_linux
     ./patch_linux -i Image -o oImage
     if [ ! -f oImage ]; then
@@ -468,7 +479,9 @@ sed -i 's/\/\/39 01 00 00 11 00 03 51 03 FF/39 01 00 00 11 00 03 51 03 FF/g' ${d
 make $MAKE_ARGS ${TARGET_DEVICE}_defconfig
 
 if [ $KSU_ENABLE -eq 1 ]; then
-    # KSU config block (MIUI): clean line = KSU + KPROBES + EXT4_FS + KPM,
+    # KSU config block (MIUI): clean line = KSU + KPROBES + EXT4_FS with KPM **off**
+    # (t17: KernelSU v4.2.0's kernel/kpm/kpm.c uses the 5.0+ two-argument
+    # access_ok() and does not compile on 4.19 - see the gate below),
     # SUSFS line = KSU + KSU_MANUAL_HOOK + KSU_SUSFS + KSU_SUSFS_* + KPM.
     if [ "$WITH_SUSFS" -eq 1 ]; then
         scripts/config --file out/.config \
@@ -496,20 +509,21 @@ if [ $KSU_ENABLE -eq 1 ]; then
         -e KSU \
         -e KPROBES \
         -e EXT4_FS \
-        -e KPM
+        -d KPM
     fi
 
     # scripts/config does not resolve dependencies: re-solve, then gate.
     make $MAKE_ARGS olddefconfig
 
     require_config KSU
-    require_config KPM
     if [ "$WITH_SUSFS" -eq 1 ]; then
+        require_config KPM
         require_config KSU_SUSFS
         forbid_config KSU_SUSFS_SUS_SU
     else
         require_config KPROBES
         require_config EXT4_FS
+        forbid_config KPM
         forbid_symbol KSU_MANUAL_HOOK
     fi
 else
@@ -565,13 +579,14 @@ scripts/config --file out/.config \
 make $MAKE_ARGS olddefconfig
 if [ $KSU_ENABLE -eq 1 ]; then
     require_config KSU
-    require_config KPM
     if [ "$WITH_SUSFS" -eq 1 ]; then
+        require_config KPM
         require_config KSU_SUSFS
         forbid_config KSU_SUSFS_SUS_SU
     else
         require_config KPROBES
         require_config EXT4_FS
+        forbid_config KPM
         forbid_symbol KSU_MANUAL_HOOK
     fi
 fi
@@ -599,9 +614,12 @@ rm -rf anykernel/kernels/
 mkdir -p anykernel/kernels/
 
 # Patch for SukiSU KPM support. 
-if [ $KSU_ENABLE -eq 1 ]; then
+if [ $KSU_ENABLE -eq 1 ] && [ "$WITH_SUSFS" -eq 1 ]; then
     cd out/arch/arm64/boot/
-    wget -q https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.13.0/patch_linux
+    # KPM image patch: SUSFS line only. The clean line builds with CONFIG_KPM=n
+    # (see the gates above), so patching its image would be meaningless.
+    # Version pinned to 0.12.0 = the release used by the last known-good package.
+    wget -q https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.0/patch_linux
     chmod +x patch_linux
     ./patch_linux -i Image -o oImage
     if [ ! -f oImage ]; then
