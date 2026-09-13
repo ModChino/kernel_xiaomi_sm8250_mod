@@ -9,6 +9,12 @@ name: Build enuma kernel (SukiSU dual-line)
 # this workflow pins MIUI_ONLY=1. build.sh's AOSP block (MIUI_ONLY=0) is NOT
 # exercised by CI and is therefore unverified in this delivery (the AOSP variant
 # is out of scope); it is kept for local/manual use only.
+#
+# t17: the toolchain is the AOSP clang r487747c prebuilt (banner
+# "Android (10087095, +pgo, +bolt, +lto, -mlgo, based on r487747c) clang version
+# 17.0.2"), which is the compiler the last known-good released enuma package was
+# built with; the repo's documented proton-clang 20210522 is kept only as the
+# build.sh default (overridable via TOOLCHAIN_PATH).
 
 on:
   workflow_dispatch:
@@ -59,17 +65,28 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential git curl wget zip unzip ccache make bc bison flex \
-            libssl-dev libelf-dev python3 cpio rsync patch
+            libssl-dev libelf-dev python3 cpio rsync patch \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
           git --version
 
-      - name: Install proton-clang 20210522
+      - name: Install AOSP clang r487747c (known-good toolchain)
+        # Mirror: Arman-ATI/prebuilts_clang_host_linux-x86_clang-r487747c (default
+        # branch "main", ~363 MB; bin/clang verified present, 2939268 B, together
+        # with ld.lld / llvm-ar / llvm-objcopy).
+        # Equivalent mirrors carrying the same prebuilt (bin/clang is the same
+        # 2939268 B file): project-raspberry/prebuilts_clang_host_linux-x86_clang-r487747c,
+        # halogenOS/android_prebuilts_clang_host_linux-x86_clang-r487747c.
+        # build.sh only needs bin/ on PATH plus aarch64-linux-gnu-ld /
+        # arm-linux-gnueabi-ld (installed above via binutils-*-linux-gnu).
         run: |
-          mkdir -p $HOME/proton-clang
-          cd $HOME/proton-clang
-          wget -q https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.zip
-          unzip -q 20210522.zip
-          test -x $HOME/proton-clang/proton-clang-20210522/bin/clang
-          $HOME/proton-clang/proton-clang-20210522/bin/clang --version
+          git clone --depth=1 --single-branch \
+            https://github.com/Arman-ATI/prebuilts_clang_host_linux-x86_clang-r487747c "$HOME/aosp-clang"
+          test -x "$HOME/aosp-clang/bin/clang"
+          "$HOME/aosp-clang/bin/clang" --version > /tmp/clang-banner.txt 2>&1
+          cat /tmp/clang-banner.txt
+          grep -Eq 'r487747c|clang version 17\.' /tmp/clang-banner.txt \
+            || { echo "FATAL: this is not the r487747c clang 17 prebuilt"; exit 1; }
+          echo "TOOLCHAIN_PATH=$HOME/aosp-clang/bin" >> "$GITHUB_ENV"
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -93,6 +110,7 @@ jobs:
           WITH_SUSFS: ${{ matrix.susfs }}
         run: |
           set -o pipefail
+          echo "TOOLCHAIN_PATH=$TOOLCHAIN_PATH"
           bash build.sh "${{ inputs.device }}" ksu 2>&1 | tee build-susfs${{ matrix.susfs }}.log
 
       - name: Upload kernel zip
