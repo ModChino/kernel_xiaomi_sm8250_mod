@@ -1,6 +1,54 @@
 #!/bin/bash
 
 # Some logics of this script are copied from [scripts/build_kernel]. Thanks to UtsavBalar1231.
+#
+# ---------------------------------------------------------------------------
+# enuma (Xiaomi Pad 5 Pro 5G) - TWO KernelSU lines in ONE script
+#
+#   MIUI_ONLY=1 (default) build only the MIUI variant, the AOSP block is skipped
+#   WITH_SUSFS=0 (default) clean line : SukiSU-Ultra/SukiSU-Ultra v4.2.0  (4.x)
+#                          -> Kernel_MIUI_enuma_SukiSU_*_anykernel3_*.zip
+#   WITH_SUSFS=1           SUSFS line : KernelSU carrying the SUSFS 1.5.x glue
+#                          -> Kernel_MIUI_enuma_SukiSU-SUSFS_*_anykernel3_*.zip
+#
+# Usage:
+#     MIUI_ONLY=1 WITH_SUSFS=0 bash build.sh enuma ksu
+#     MIUI_ONLY=1 WITH_SUSFS=1 bash build.sh enuma ksu
+#
+# KernelSU sources - both pinned to immutable commits:
+#   clean line : 85eb4a95b8a61d756ecf53b9c5785e48e1b15039 = tag v4.2.0
+#   SUSFS line : f4863b20cc8dc0f8cc67418980f022e43014b598 = liyafe1997/SukiSU-Ultra "susfs-1.5.7"
+#
+# Why the SUSFS line does NOT patch ShirkNeko/susfs4ksu@kernel-4.19 (SUSFS 1.5.8)
+# into the v4.2.0 KernelSU tree:
+#   * this kernel tree ALREADY contains the SUSFS fs-side code
+#     (fs/susfs.c + include/linux/susfs.h = "v1.5.7", fs/Makefile:
+#      obj-$(CONFIG_KSU_SUSFS) += susfs.o), so there is nothing to patch in:
+#     that release's 50_add_susfs_in_kernel-4.19.patch is the very fs-side patch
+#     this tree already carries (at 1.5.7) and its fs/Makefile hunk would conflict;
+#   * its 10_enable_susfs_for_ksu.patch is written against KernelSU 3.x
+#     (baseline "sync with KernelSU tag v1.0.5"): 11 of its 18 target files
+#     (core_hook.c, ksu.c, ksud.c, allowlist.c, apk_sign.c, sucompat.c, ...)
+#     no longer exist in the 4.x tree and 3 hunks conflict -> it cannot be
+#     applied to v4.2.0 at all;
+#   * the SUSFS line therefore uses the KernelSU tree whose SUSFS side matches
+#     the in-tree 1.5.7 code (liyafe1997's susfs-1.5.7 branch), which is also the
+#     combination already verified on the device (ksud 3.2.0 + susfs4ksu
+#     1.5.7-R28).
+#   Consequence: metamodule / SukiSU 4.x userspace comes from the clean line.
+#   The SUSFS line stays on the older KernelSU and must be used with a 3.2.x
+#   SukiSU manager (upstream README: "SukiSU Manager 4.0 and above are not
+#   supported yet of the SukiSU version in this kernel").
+#
+# Both lines share one kernel tree, therefore:
+#   * the AOSP and the MIUI build block each apply the KernelSU configuration
+#     block on their own (kept in sync by hand, as in the original script);
+#   * scripts/config never validates symbol names (it only rewrites .config) and
+#     `make olddefconfig` silently drops symbols that do not exist or whose
+#     dependencies are unmet -> every config block is followed by an explicit
+#     `make olddefconfig` plus hard gates, so a line can never be "green" while
+#     the requested feature is actually missing from the kernel.
+# ---------------------------------------------------------------------------
 
 # Ensure the script exits on error
 set -e
@@ -8,6 +56,35 @@ set -e
 TOOLCHAIN_PATH=$HOME/proton-clang/proton-clang-20210522/bin
 GIT_COMMIT_ID=$(git rev-parse --short=8 HEAD)
 TARGET_DEVICE=$1
+
+# ---- build line switches ---------------------------------------------------
+# MIUI_ONLY: 1 (default) = build the MIUI variant only, skip the AOSP block
+# WITH_SUSFS: 0 (default) = clean SukiSU v4.2.0 line, 1 = SUSFS line
+MIUI_ONLY=${MIUI_ONLY:-1}
+WITH_SUSFS=${WITH_SUSFS:-0}
+
+case "$MIUI_ONLY" in
+    0|1) ;;
+    *) echo "MIUI_ONLY must be 0 or 1 (got: [$MIUI_ONLY])"; exit 1 ;;
+esac
+
+case "$WITH_SUSFS" in
+    0|1) ;;
+    *) echo "WITH_SUSFS must be 0 or 1 (got: [$WITH_SUSFS])"; exit 1 ;;
+esac
+
+# ---- KernelSU sources (immutable commits) ----------------------------------
+# clean line: SukiSU-Ultra/SukiSU-Ultra tag v4.2.0 (4.x, metamodule capable)
+KSU_REF_CLEAN=85eb4a95b8a61d756ecf53b9c5785e48e1b15039
+# SUSFS line: liyafe1997/SukiSU-Ultra branch susfs-1.5.7 (matches this tree's
+# in-kernel SUSFS 1.5.7 fs-side code)
+KSU_REF_SUSFS=f4863b20cc8dc0f8cc67418980f022e43014b598
+# Official setup.sh of v4.2.0 (blob 7e57e19b8408c7542865af5076cbee28783b3c7c).
+# It clones https://github.com/SukiSU-Ultra/SukiSU-Ultra (unless a KernelSU/
+# directory already exists), wires it into drivers/ and checks out the ref given
+# as its first argument. A commit sha is used because "git checkout v4.2.0" is
+# not guaranteed to resolve in every clone setup.
+KSU_SETUP_URL=https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/85eb4a95b8a61d756ecf53b9c5785e48e1b15039/kernel/setup.sh
 
 if [ -z "$1" ]; then
     echo "Error: No argument provided, please specific a target device." 
@@ -83,19 +160,110 @@ clang --version
 
 
 KSU_ZIP_STR=NoKernelSU
-if [ "$2" == "ksu" ]; then
+if [ "${2:-}" = "ksu" ]; then
     KSU_ENABLE=1
-    KSU_ZIP_STR=SukiSU-SUSFS
+    if [ "$WITH_SUSFS" -eq 1 ]; then
+        KSU_ZIP_STR=SukiSU-SUSFS
+    else
+        KSU_ZIP_STR=SukiSU
+    fi
 else
     KSU_ENABLE=0
 fi
 
 
+# ---- config gates ----------------------------------------------------------
+# scripts/config does not check the validity of .config and `make olddefconfig`
+# drops unknown / unsatisfied symbols silently. These helpers turn the resulting
+# "green but feature-less" build into a hard failure.
+require_config() {
+    if ! grep -q "^CONFIG_$1=y" out/.config; then
+        echo "FATAL: CONFIG_$1 is not enabled in out/.config."
+        echo "       (symbol unknown or its dependencies are not met - the feature would be missing)"
+        exit 1
+    fi
+}
+
+forbid_config() {
+    if grep -q "^CONFIG_$1=y" out/.config; then
+        echo "FATAL: CONFIG_$1 must not be enabled in out/.config."
+        exit 1
+    fi
+}
+
+forbid_symbol() {
+    if grep -q "CONFIG_$1" out/.config; then
+        echo "FATAL: CONFIG_$1 must not appear in out/.config."
+        echo "       (this symbol does not exist on the selected line)"
+        exit 1
+    fi
+}
+
+
 echo "TARGET_DEVICE: $TARGET_DEVICE"
+echo "MIUI_ONLY: [$MIUI_ONLY] WITH_SUSFS: [$WITH_SUSFS] KSU: [$KSU_ZIP_STR]"
 
 if [ $KSU_ENABLE -eq 1 ]; then
     echo "KSU is enabled"
-    curl -LSs "https://github.com/liyafe1997/SukiSU-Ultra/raw/4ff14cf0051d04209c4abd5027d99d8e7780ef5b/kernel/setup.sh" | bash -s f4863b20cc8dc0f8cc67418980f022e43014b598
+    if [ "$WITH_SUSFS" -eq 1 ]; then
+        KSU_REF=$KSU_REF_SUSFS
+        # The official setup.sh can only clone the official repository, so the
+        # fork tree is fetched here first at its pinned commit; setup.sh then
+        # skips its own clone (test -d "$GKI_ROOT/KernelSU" || git clone ...)
+        # and only performs the wiring + checkout.
+        git clone https://github.com/liyafe1997/SukiSU-Ultra KernelSU
+    else
+        KSU_REF=$KSU_REF_CLEAN
+    fi
+
+    echo "KernelSU ref: [$KSU_REF]"
+    echo "KernelSU setup: [$KSU_SETUP_URL]"
+    curl -LSs "$KSU_SETUP_URL" | bash -s "$KSU_REF"
+
+    # setup.sh swallows a failed `git checkout <ref>` (git checkout "$1" || echo
+    # "Checkout default branch"), so verify the tree that will really be compiled.
+    KSU_HEAD=$(git -C KernelSU rev-parse HEAD)
+    if [ "$KSU_HEAD" != "$KSU_REF" ]; then
+        echo "FATAL: KernelSU is at [$KSU_HEAD] but [$KSU_REF] was requested."
+        exit 1
+    fi
+    if [ ! -e drivers/kernelsu/Kconfig ] && [ ! -e drivers/kernelsu/Kbuild ]; then
+        echo "FATAL: drivers/kernelsu is not wired into the kernel tree."
+        exit 1
+    fi
+
+    # t13/F1: the 4.x KernelSU tree needs the private security/selinux/ss include
+    # directory. Its kernel/feature/selinux_hide.c includes <ss/context.h>,
+    # <ss/services.h>, <ss/mls.h> and <ss/conditional.h>, and in this 4.19 kernel
+    # those headers live in security/selinux/ss/ - neither of the two paths that
+    # the tree already carries (security/selinux, security/selinux/include)
+    # resolves them, so the A line would die with "fatal error: ss/context.h".
+    # The 4.x tree compiles through KernelSU/kernel/Kbuild: append the missing
+    # -I there (keeping both existing paths), then gate on it so a kernel without
+    # that include can never be produced. The 3.x SUSFS line has no Kbuild and no
+    # feature/selinux_hide.c, so there is nothing to patch for it.
+    if [ -f KernelSU/kernel/Kbuild ]; then
+        if ! grep -q 'security/selinux/ss' KernelSU/kernel/Kbuild; then
+            sed -i 's|-I\$(srctree)/security/selinux/include|-I$(srctree)/security/selinux/include -I$(srctree)/security/selinux/ss|' KernelSU/kernel/Kbuild
+        fi
+        if ! grep -q 'security/selinux/ss' KernelSU/kernel/Kbuild; then
+            echo "FATAL: [KernelSU/kernel/Kbuild] does not carry -I\$(srctree)/security/selinux/ss."
+            echo "       (the 4.x selinux_hide.c includes <ss/...>, the build would fail)"
+            exit 1
+        fi
+        echo "KernelSU/kernel/Kbuild: security/selinux/ss include is in place."
+    else
+        echo "NOTE: KernelSU/kernel/Kbuild not present (3.x SUSFS tree) - the security/selinux/ss include is not needed there."
+    fi
+
+    if [ "$WITH_SUSFS" -eq 1 ]; then
+        # Without the SUSFS glue in the KernelSU tree the SUSFS line would only
+        # look like SUSFS: fail loudly instead of producing a fake kernel.
+        if ! grep -q '^config KSU_SUSFS$' KernelSU/kernel/Kconfig; then
+            echo "FATAL: KernelSU tree [$KSU_REF] has no SUSFS support (CONFIG_KSU_SUSFS is missing)."
+            exit 1
+        fi
+    fi
 else
     echo "KSU is disabled"
 fi
@@ -116,30 +284,64 @@ local_version_date_str="-$(date +%Y%m%d)-${GIT_COMMIT_ID}-perf"
 sed -i "s/${local_version_str}/${local_version_date_str}/g" arch/arm64/configs/${TARGET_DEVICE}_defconfig
 
 # ------------- Building for AOSP -------------
+# Skipped when MIUI_ONLY=1 (default): the MIUI block below builds the same kernel
+# with the MIUI config, so building both only doubles the build time.
+#
+# NOT VERIFIED (t3/M1): the GitHub Actions workflow always passes MIUI_ONLY=1, so
+# this whole AOSP block is never exercised by CI. The AOSP variant is out of scope
+# for this delivery (Q5) - MIUI_ONLY=0 is kept for local/manual use only and has
+# not been validated here.
+
+if [ "$MIUI_ONLY" -eq 0 ]; then
 
 echo "Building for AOSP......"
 make $MAKE_ARGS ${TARGET_DEVICE}_defconfig
 
 if [ $KSU_ENABLE -eq 1 ]; then
-    scripts/config --file out/.config \
-    -e KSU \
-    -e KSU_MANUAL_HOOK \
-    -e KSU_SUSFS_HAS_MAGIC_MOUNT \
-    -d KSU_SUSFS_SUS_PATH \
-    -e KSU_SUSFS_SUS_MOUNT \
-    -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
-    -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
-    -e KSU_SUSFS_SUS_KSTAT \
-    -d KSU_SUSFS_SUS_OVERLAYFS \
-    -e KSU_SUSFS_TRY_UMOUNT \
-    -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
-    -e KSU_SUSFS_SPOOF_UNAME \
-    -e KSU_SUSFS_ENABLE_LOG \
-    -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-    -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
-    -d KSU_SUSFS_OPEN_REDIRECT \
-    -d KSU_SUSFS_SUS_SU \
-    -e KPM
+    # KSU config block (AOSP): clean line = KSU + KPROBES + EXT4_FS + KPM,
+    # SUSFS line = KSU + KSU_MANUAL_HOOK + KSU_SUSFS + KSU_SUSFS_* + KPM.
+    if [ "$WITH_SUSFS" -eq 1 ]; then
+        scripts/config --file out/.config \
+        -e KSU \
+        -e KSU_MANUAL_HOOK \
+        -e KSU_SUSFS \
+        -e KSU_SUSFS_HAS_MAGIC_MOUNT \
+        -d KSU_SUSFS_SUS_PATH \
+        -e KSU_SUSFS_SUS_MOUNT \
+        -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+        -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+        -e KSU_SUSFS_SUS_KSTAT \
+        -d KSU_SUSFS_SUS_OVERLAYFS \
+        -e KSU_SUSFS_TRY_UMOUNT \
+        -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+        -e KSU_SUSFS_SPOOF_UNAME \
+        -e KSU_SUSFS_ENABLE_LOG \
+        -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+        -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+        -d KSU_SUSFS_OPEN_REDIRECT \
+        -d KSU_SUSFS_SUS_SU \
+        -e KPM
+    else
+        scripts/config --file out/.config \
+        -e KSU \
+        -e KPROBES \
+        -e EXT4_FS \
+        -e KPM
+    fi
+
+    # scripts/config does not resolve dependencies: re-solve, then gate.
+    make $MAKE_ARGS olddefconfig
+
+    require_config KSU
+    require_config KPM
+    if [ "$WITH_SUSFS" -eq 1 ]; then
+        require_config KSU_SUSFS
+        forbid_config KSU_SUSFS_SUS_SU
+    else
+        require_config KPROBES
+        require_config EXT4_FS
+        forbid_symbol KSU_MANUAL_HOOK
+    fi
 else
     scripts/config --file out/.config -d KSU
 fi
@@ -164,9 +366,13 @@ mkdir -p anykernel/kernels/
 # Patch for SukiSU KPM support. 
 if [ $KSU_ENABLE -eq 1 ]; then
     cd out/arch/arm64/boot/
-    wget https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.0/patch_linux
+    wget -q https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.13.0/patch_linux
     chmod +x patch_linux
-    ./patch_linux
+    ./patch_linux -i Image -o oImage
+    if [ ! -f oImage ]; then
+        echo "FATAL: KPM patch did not produce [oImage]."
+        exit 1
+    fi
     rm Image
     mv oImage Image
     cd -
@@ -187,6 +393,8 @@ cd ..
 
 
 echo "Build for AOSP finished."
+
+fi
 
 # ------------- End of Building for AOSP -------------
 #  If you don't need AOSP you can comment out the above block [Building for AOSP]
@@ -260,30 +468,68 @@ sed -i 's/\/\/39 01 00 00 11 00 03 51 03 FF/39 01 00 00 11 00 03 51 03 FF/g' ${d
 make $MAKE_ARGS ${TARGET_DEVICE}_defconfig
 
 if [ $KSU_ENABLE -eq 1 ]; then
-    scripts/config --file out/.config \
-    -e KSU \
-    -e KSU_MANUAL_HOOK \
-    -e KSU_SUSFS_HAS_MAGIC_MOUNT \
-    -d KSU_SUSFS_SUS_PATH \
-    -e KSU_SUSFS_SUS_MOUNT \
-    -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
-    -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
-    -e KSU_SUSFS_SUS_KSTAT \
-    -d KSU_SUSFS_SUS_OVERLAYFS \
-    -e KSU_SUSFS_TRY_UMOUNT \
-    -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
-    -e KSU_SUSFS_SPOOF_UNAME \
-    -e KSU_SUSFS_ENABLE_LOG \
-    -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-    -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
-    -d KSU_SUSFS_OPEN_REDIRECT \
-    -d KSU_SUSFS_SUS_SU \
-    -e KPM
+    # KSU config block (MIUI): clean line = KSU + KPROBES + EXT4_FS + KPM,
+    # SUSFS line = KSU + KSU_MANUAL_HOOK + KSU_SUSFS + KSU_SUSFS_* + KPM.
+    if [ "$WITH_SUSFS" -eq 1 ]; then
+        scripts/config --file out/.config \
+        -e KSU \
+        -e KSU_MANUAL_HOOK \
+        -e KSU_SUSFS \
+        -e KSU_SUSFS_HAS_MAGIC_MOUNT \
+        -d KSU_SUSFS_SUS_PATH \
+        -e KSU_SUSFS_SUS_MOUNT \
+        -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+        -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+        -e KSU_SUSFS_SUS_KSTAT \
+        -d KSU_SUSFS_SUS_OVERLAYFS \
+        -e KSU_SUSFS_TRY_UMOUNT \
+        -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+        -e KSU_SUSFS_SPOOF_UNAME \
+        -e KSU_SUSFS_ENABLE_LOG \
+        -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+        -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+        -d KSU_SUSFS_OPEN_REDIRECT \
+        -d KSU_SUSFS_SUS_SU \
+        -e KPM
+    else
+        scripts/config --file out/.config \
+        -e KSU \
+        -e KPROBES \
+        -e EXT4_FS \
+        -e KPM
+    fi
+
+    # scripts/config does not resolve dependencies: re-solve, then gate.
+    make $MAKE_ARGS olddefconfig
+
+    require_config KSU
+    require_config KPM
+    if [ "$WITH_SUSFS" -eq 1 ]; then
+        require_config KSU_SUSFS
+        forbid_config KSU_SUSFS_SUS_SU
+    else
+        require_config KPROBES
+        require_config EXT4_FS
+        forbid_symbol KSU_MANUAL_HOOK
+    fi
 else
     scripts/config --file out/.config -d KSU
 fi
 
 
+# MIUI-only fine tuning (inherited verbatim from build.sh.orig; the block itself
+# is frozen by SPEC §8 item 12).
+# t3/L1: KPERFEVENTS, MIHW and MI_MEMORY_SYSFS have NO definition in this Kconfig
+# tree (KPERFEVENTS matches nothing at all; MIHW / MI_MEMORY_SYSFS only appear in
+# the *stock* defconfigs), so `make` drops those three silently - they are no-ops
+# inherited from the original script, not features, and are intentionally kept.
+# t13/F3: the two lines `-d CONFIG_MODULE_SIG_SHA512` / `-d CONFIG_MODULE_SIG_HASH`
+# have been deleted here: scripts/config prefixes every argument with "CONFIG_",
+# so they only ever wrote the bogus symbols CONFIG_CONFIG_MODULE_SIG_SHA512 /
+# CONFIG_CONFIG_MODULE_SIG_HASH (dropped again by the next olddefconfig) and
+# never disabled anything. They are deliberately NOT re-added as
+# `-d MODULE_SIG_SHA512` / `-d MODULE_SIG_HASH`: that would make them effective
+# and silently change module signing behaviour.
 scripts/config --file out/.config \
     --set-str STATIC_USERMODEHELPER_PATH /system/bin/micd \
     -e PERF_CRITICAL_RT_TASK	\
@@ -305,13 +551,30 @@ scripts/config --file out/.config \
     -d MI_MEMORY_SYSFS \
     -e TASK_DELAY_ACCT \
     -e MIUI_ZRAM_MEMORY_TRACKING \
-    -d CONFIG_MODULE_SIG_SHA512 \
-    -d CONFIG_MODULE_SIG_HASH \
     -e MI_FRAGMENTION \
     -e PERF_HELPER \
     -e BOOTUP_RECLAIM \
     -e MI_RECLAIM \
     -e RTMM \
+
+# t3/L2: this MIUI-only block runs after the KSU gates above and was never
+# re-validated - a symbol changed here could drop KernelSU / KPROBES / EXT4_FS and
+# still build "green". Re-solve the dependencies (exactly what the following
+# `make` would do through syncconfig, so the resulting .config is unchanged) and
+# re-run the same gates before compiling.
+make $MAKE_ARGS olddefconfig
+if [ $KSU_ENABLE -eq 1 ]; then
+    require_config KSU
+    require_config KPM
+    if [ "$WITH_SUSFS" -eq 1 ]; then
+        require_config KSU_SUSFS
+        forbid_config KSU_SUSFS_SUS_SU
+    else
+        require_config KPROBES
+        require_config EXT4_FS
+        forbid_symbol KSU_MANUAL_HOOK
+    fi
+fi
 
 make $MAKE_ARGS -j$(nproc)
 
@@ -338,9 +601,13 @@ mkdir -p anykernel/kernels/
 # Patch for SukiSU KPM support. 
 if [ $KSU_ENABLE -eq 1 ]; then
     cd out/arch/arm64/boot/
-    wget https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.0/patch_linux
+    wget -q https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.13.0/patch_linux
     chmod +x patch_linux
-    ./patch_linux
+    ./patch_linux -i Image -o oImage
+    if [ ! -f oImage ]; then
+        echo "FATAL: KPM patch did not produce [oImage]."
+        exit 1
+    fi
     rm Image
     mv oImage Image
     cd -
