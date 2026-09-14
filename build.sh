@@ -1026,13 +1026,155 @@ T43LIST
     # that handling had no existence guard (a runtime check inside the guarded block
     # could never catch its own missing guard).
     t46_self="${0:-build.sh}"
+    # t52/F3: anchor this gate to the single t40 guard line instead of scanning the whole
+    # script - a decoy comment line containing the literal "[ -f <path> ]" used to satisfy
+    # the old whole-file `grep -qF`.
+    t52_guard_ln=$(grep -n '^    if \[ -f KernelSU/kernel/selinux/selinux.c \]' "$t46_self" | head -1 | cut -d: -f1)
+    if [ -z "${t52_guard_ln:-}" ]; then
+        echo "FATAL: [t52] the t40 existence-guard line (^    if [ -f KernelSU/kernel/selinux/selinux.c ]) is gone."
+        exit 1
+    fi
+    t52_guard=$(sed -n "${t52_guard_ln}p" "$t46_self")
+    t52_cnt=$(printf '%s' "$t52_guard" | grep -oF '[ -f ' | wc -l)
+    if [ "$t52_cnt" -ne 10 ]; then
+        echo "FATAL: [t52] the t40 guard line carries $t52_cnt existence tests, expected exactly 10."
+        exit 1
+    fi
     for t46_p in KernelSU/kernel/selinux/selinux.c KernelSU/kernel/selinux/rules.c KernelSU/kernel/selinux/sepolicy.c KernelSU/kernel/feature/selinux_hide.c KernelSU/kernel/infra/seccomp_cache.c KernelSU/kernel/feature/cpu_spoof.c KernelSU/kernel/policy/allowlist.c KernelSU/kernel/policy/app_profile.c KernelSU/kernel/manager/pkg_observer.c KernelSU/kernel/supercall/dispatch.c; do
-        if ! grep -qF -- "[ -f $t46_p ]" "$t46_self"; then
-            echo "FATAL: [t46] [$t46_p] is handled without a [ -f ... ] existence guard (the 3.x tree would abort)."
+        case "$t52_guard" in
+            *"[ -f $t46_p ]"*) ;;
+            *)
+                echo "FATAL: [t52] [$t46_p] is missing from the t40 existence-guard line (a decoy comment cannot satisfy this)."
+                exit 1
+                ;;
+        esac
+    done
+    echo "t46 B-leg guard coverage gate passed: the single t40 guard line carries exactly 10 existence tests (comment-proof)."
+
+    # t49: the fork's kernel tree was patched for the *3.x* KernelSU hook API and
+    # guards those call sites with `#ifdef CONFIG_KSU` (both lines set CONFIG_KSU), so
+    # the 4.x tree - which renamed/removed that API - leaves 8 symbols undefined at
+    # link time (run8: fs/open.c:461, fs/read_write.c:598/599, fs/stat.c:386/539,
+    # fs/exec.c:1954/1955/1987, drivers/tty/pty.c:724, drivers/input/input.c:458).
+    # This is NOT a config problem: the kernel tree's own `extern` declarations are the
+    # contract, and the 4.x tree simply does not define those names any more
+    # (grep: ksu_handle_faccessat/stat/devpts/vfs_read_hook/execveat_hook/input_hook = 0
+    # hits in the 4.x tree). So we provide an API-shaped compat layer with exactly the
+    # kernel tree's signatures, and keep the three legacy enable flags false: the 4.x
+    # line does its own hooking (kprobe/tracepoint + *_sucompat/_ksud), and the kernel
+    # tree's `else` branches (e.g. ksu_handle_execveat_sucompat) keep working. That
+    # preserves the SPEC rule "A line has zero MANUAL_HOOK" - no SPEC change needed.
+    if [ -f KernelSU/kernel/runtime/ksud_integration.c ]; then
+        KI=KernelSU/kernel/runtime/ksud_integration.c
+        if ! grep -q 't49: legacy 3.x hook API compat layer' "$KI"; then
+            # ksu_handle_sys_read already exists here as `static void`; the kernel tree
+            # declares it `int` with the same three parameters, so un-static it and give
+            # it the matching return type (its only caller ignores the result).
+            sed -i 's|^static void ksu_handle_sys_read(unsigned int fd, char __user \*\*buf_ptr, size_t \*count_ptr)$|int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr) /* t49: un-static + int return (kernel-tree contract) */|' "$KI"
+            # t52/F1+F2: the function is `int` now, so its early-out must be `return 0;`
+            # (a bare `return;` is ill-formed in a non-void function - C11 6.8.6.4p1 - and
+            # -Werror turns -Wreturn-type into a hard error), and the new `return 0;` must
+            # be inserted AFTER fput(file); otherwise fput() becomes unreachable and every
+            # hooked sys_read leaks a struct file reference. Both edits are scoped to this
+            # function's line range so no other function in the file can be touched.
+            sed -i '/^int ksu_handle_sys_read(/,/^}/ s|^\([[:space:]]*\)return;$|\1return 0; /* t52: int function, not void */|' "$KI"
+            sed -i '/^int ksu_handle_sys_read(/,/^}/ s|^\([[:space:]]*\)fput(file);$|\1fput(file);\n\1return 0; /* t49 */|' "$KI"
+            cat >> "$KI" <<'T49COMPAT'
+
+/* t49: legacy 3.x hook API compat layer.
+ * The fork's kernel tree (fs/open.c, fs/read_write.c, fs/stat.c, fs/exec.c,
+ * drivers/tty/pty.c, drivers/input/input.c) declares and calls these 8 symbols
+ * under `#ifdef CONFIG_KSU`; the 4.x tree renamed the API, so without this layer
+ * vmlinux fails to link. Signatures are copied character-for-character from the
+ * kernel tree's own extern declarations. The three enable flags are false: the 4.x
+ * line hooks through its own kprobe/tracepoint machinery (and the kernel tree's
+ * `else` branch still calls ksu_handle_execveat_sucompat), so nothing is lost and
+ * the legacy manual-hook paths stay inert. */
+bool ksu_vfs_read_hook __read_mostly = false;
+bool ksu_execveat_hook __read_mostly = false;
+bool ksu_input_hook __read_mostly = false;
+
+int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags)
+{
+    return 0;
+}
+
+int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
+{
+    return 0;
+}
+
+int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags)
+{
+    return 0;
+}
+
+int ksu_handle_devpts(struct inode *inode)
+{
+    return 0;
+}
+T49COMPAT
+        fi
+        # t52/F3: the symbol check must look at *code* lines only - the old whole-file
+        # substring grep was satisfied by a decoy comment mentioning the symbol name.
+        t52_code() { awk '{ if ($0 ~ /^[[:space:]]*\/\*/) c = 1; if (!c) print; if (c && $0 ~ /\*\//) c = 0 }' "$1"; }
+        t52_code "$KI" > "$KI.t52code"
+        for t49_s in 'ksu_vfs_read_hook:bool' 'ksu_execveat_hook:bool' 'ksu_input_hook:bool' 'ksu_handle_faccessat:int' 'ksu_handle_sys_read:int' 'ksu_handle_stat:int' 'ksu_handle_execveat:int' 'ksu_handle_devpts:int'; do
+            t49_n=${t49_s%%:*}
+            t49_t=${t49_s##*:}
+            if [ "$t49_t" = bool ]; then
+                t49_p="^[[:space:]]*bool[[:space:]]+$t49_n[[:space:]]+__read_mostly"
+            else
+                t49_p="^[[:space:]]*int[[:space:]]+$t49_n[[:space:]]*\("
+            fi
+            if ! grep -qE "$t49_p" "$KI.t52code"; then
+                echo "FATAL: [t52] [$KI] has no top-level definition of '$t49_n' (a comment mentioning it does not count)."
+                exit 1
+            fi
+        done
+        rm -f "$KI.t52code"
+        echo "t49 legacy hook compat layer applied: 8 kernel-tree symbols defined (flags false, handlers no-op)."
+
+        # t52/F1+F2 self-check: the t49 edit turned ksu_handle_sys_read() from `static void`
+        # into `int`, so the body must be legal and leak-free - no bare `return;` (C11
+        # 6.8.6.4p1; -Werror would make it a hard error) and fput() must come before the
+        # `return 0;` (otherwise every hooked sys_read leaks a struct file reference).
+        if ! awk '
+            /^int ksu_handle_sys_read\(/ { in_fn = 1 }
+            in_fn && /^[[:space:]]*return;[[:space:]]*$/ { bad_ret = 1 }
+            in_fn && /ksu_install_rc_hook\(file\);/ { after_hook = 1 }
+            in_fn && /^[[:space:]]*return/ && after_hook && !fput_seen { bad_order = 1 }
+            in_fn && /fput\(file\);/ { fput_seen = 1 }
+            in_fn && /^}/ {
+                if (bad_ret) { print "reason: bare `return;` inside an int function (C11 6.8.6.4p1)"; exit 1 }
+                if (bad_order) { print "reason: a return sits between ksu_install_rc_hook() and fput() -> fput is unreachable (struct file reference leak)"; exit 1 }
+                if (!fput_seen) { print "reason: fput(file) is missing"; exit 1 }
+                found = 1; exit 0
+            }
+            END { if (!found) { print "reason: int ksu_handle_sys_read() not found"; exit 1 } }
+        ' "$KI"; then
+            echo "FATAL: [t52] [$KI] ksu_handle_sys_read() is not a legal, leak-free int function (reason above)."
             exit 1
         fi
-    done
-    echo "t46 B-leg guard coverage gate passed: all 10 handled 4.x-only files sit behind existence tests."
+        echo "t52 ksu_handle_sys_read body check passed: int return, fput() before return, no bare return."
+
+        # t49: policy/app_profile.c:123 calls seccomp_filter_release(), which is 5.9+;
+        # 4.19 has the same operation as put_seccomp_filter(struct task_struct *)
+        # (kernel/seccomp.c:522, declared in include/linux/seccomp.h:83). Its own
+        # declaration at :69 is guarded the same way. (The NEED_BACKPORT_COMPAT block
+        # at :240-251 is `>= 6.6 && < 6.11` => not compiled here.)
+        if ! grep -q 't49: seccomp_filter_release is 5.9+' "$AP"; then
+            sed -i 's|^void seccomp_filter_release(struct task_struct \*tsk);$|#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0) /* t49: seccomp_filter_release is 5.9+ */\nvoid seccomp_filter_release(struct task_struct *tsk);\n#endif|' "$AP"
+            sed -i 's|^\([[:space:]]*\)seccomp_filter_release(fake);$|\1#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0) /* t49: seccomp_filter_release is 5.9+ */\n\1seccomp_filter_release(fake);\n\1#else\n\1put_seccomp_filter(fake); /* t49: 4.19 equivalent (kernel/seccomp.c:522) */\n\1#endif|' "$AP"
+        fi
+        if ! grep -q 't49: seccomp_filter_release is 5.9+' "$AP" || ! grep -q 'put_seccomp_filter(fake); /\* t49' "$AP"; then
+            echo "FATAL: [t49] [$AP] still calls seccomp_filter_release() unguarded (5.9+ symbol)."
+            exit 1
+        fi
+        echo "t49 seccomp fix applied: seccomp_filter_release guarded at 5.9, 4.19 uses put_seccomp_filter."
+    else
+        echo "NOTE: KernelSU/kernel/runtime/ksud_integration.c not present (3.x SUSFS tree) - the t49 legacy hook compat layer is not needed (the 3.x tree defines that API itself)."
+    fi
 else
     echo "KSU is disabled"
 fi
