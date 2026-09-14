@@ -1175,6 +1175,107 @@ T49COMPAT
     else
         echo "NOTE: KernelSU/kernel/runtime/ksud_integration.c not present (3.x SUSFS tree) - the t49 legacy hook compat layer is not needed (the 3.x tree defines that API itself)."
     fi
+
+    # t55: real-device oops (ramoops: 6 crashes at 2.14-2.20s, ESR 0x96000005,
+    # `pc : ksu_handle_execveat_sucompat+0x10/0x24`, fault address 0x10 = NULL+0x10).
+    # The fork's kernel tree carries 3.x-era call sites guarded by `#ifdef CONFIG_KSU`
+    # (both lines set CONFIG_KSU). Most of them call our own compat stubs, but two call
+    # `ksu_handle_execveat_sucompat()`, whose 4.x definition is
+    #   long ksu_handle_execveat_sucompat(const char __user **filename_user, int orig_nr,
+    #                                     struct pt_regs *regs)      [feature/sucompat.c:256]
+    # while the kernel tree calls it with the 3.x convention
+    #   ksu_handle_execveat_sucompat((int *)AT_FDCWD, &filename, NULL, NULL, NULL)
+    # => the 3rd (4.x) parameter `regs` receives NULL => deref at offset 0x10. t49 set
+    # ksu_execveat_hook=false, which is exactly what routes into that else branch.
+    # The 4.x tree has its own, correctly-conventioned path
+    # (hook/syscall_event_bridge.c:103 calls it with 3 args), so the kernel tree's legacy
+    # call sites are redundant *and* harmful on the 4.x line. Decision (option A, not the
+    # flag-flip B): neutralise the call sites structurally - flipping the flags would only
+    # hide the mismatched call behind a runtime condition and leave the 4.x function one
+    # config edit away from crashing again. The neutralisation is applied ONLY when the
+    # 4.x tree is present: the 3.x SUSFS line needs those very call sites (its sucompat.c
+    # defines them with the 3.x convention), so it stays untouched.
+    if [ -f KernelSU/kernel/hook/syscall_event_bridge.c ]; then
+        t55_strip() { # $1 = file, $2 = sed address, $3 = literal probe text
+            if [ -f "$1" ] && grep -qF -- "$3" "$1"; then
+                sed -i "$2" "$1"
+            fi
+        }
+        t55_strip fs/open.c \
+            '\|^[[:space:]]*ksu_handle_faccessat(&dfd, &filename, &mode, NULL);[[:space:]]*$|d' \
+            'ksu_handle_faccessat(&dfd, &filename, &mode, NULL);'
+        t55_strip fs/read_write.c \
+            '\|^[[:space:]]*if (unlikely(ksu_vfs_read_hook))[[:space:]]*$|d' \
+            'if (unlikely(ksu_vfs_read_hook))'
+        t55_strip fs/read_write.c \
+            '\|^[[:space:]]*ksu_handle_sys_read(fd, &buf, &count);[[:space:]]*$|d' \
+            'ksu_handle_sys_read(fd, &buf, &count);'
+        t55_strip fs/stat.c \
+            '\|^[[:space:]]*ksu_handle_stat(&dfd, &filename, &flag);[[:space:]]*$|d' \
+            'ksu_handle_stat(&dfd, &filename, &flag);'
+        t55_strip fs/stat.c \
+            '\|^[[:space:]]*ksu_handle_stat(&dfd, &filename, &flag); /\* 32-bit su support \*/[[:space:]]*$|d' \
+            '32-bit su support'
+        t55_strip fs/exec.c \
+            '\|^[[:space:]]*if (unlikely(ksu_execveat_hook))[[:space:]]*$|,\|^[[:space:]]*ksu_handle_execveat_sucompat((int \*)AT_FDCWD, &filename, NULL, NULL, NULL);[[:space:]]*$|d' \
+            'if (unlikely(ksu_execveat_hook))'
+        t55_strip fs/exec.c \
+            '\|^[[:space:]]*if (!ksu_execveat_hook)[[:space:]]*$|,\|32-bit su \*/[[:space:]]*$|d' \
+            'if (!ksu_execveat_hook)'
+        t55_strip drivers/tty/pty.c \
+            '\|^[[:space:]]*ksu_handle_devpts((struct inode \*)file->f_path.dentry->d_inode);[[:space:]]*$|d' \
+            'ksu_handle_devpts((struct inode *)file->f_path.dentry->d_inode);'
+        t55_strip drivers/input/input.c \
+            '\|^[[:space:]]*if (unlikely(ksu_input_hook))[[:space:]]*$|d' \
+            'if (unlikely(ksu_input_hook))'
+        t55_strip drivers/input/input.c \
+            '\|^[[:space:]]*ksu_handle_input_handle_event(&type, &code, &value);[[:space:]]*$|d' \
+            'ksu_handle_input_handle_event(&type, &code, &value);'
+
+        # t55 routing gate: no kernel-tree call site may reach a 4.x function with the
+        # 3.x convention. Each entry is `file|call text|class`; `danger` marks a site
+        # whose target is a *4.x* function (mismatched convention => the oops).
+        t55_bad=0
+        t55_n=0
+        while IFS='|' read -r t55_f t55_txt t55_cls; do
+            [ -n "${t55_f:-}" ] || continue
+            t55_n=$((t55_n + 1))
+            if grep -qF -- "$t55_txt" "$t55_f"; then
+                if [ "$t55_cls" = danger ]; then
+                    echo "FATAL: [t55] [$t55_f] still calls a 4.x function with the 3.x convention: $t55_txt"
+                    echo "       (this is the ramoops oops: regs=NULL -> NULL deref at +0x10)"
+                else
+                    echo "FATAL: [t55] [$t55_f] legacy 3.x call site not neutralised: $t55_txt"
+                fi
+                t55_bad=1
+            fi
+        done <<'T55SITES'
+fs/exec.c|ksu_handle_execveat_sucompat((int *)AT_FDCWD, &filename, NULL, NULL, NULL);|danger
+fs/open.c|ksu_handle_faccessat(&dfd, &filename, &mode, NULL);|safe
+fs/read_write.c|ksu_handle_sys_read(fd, &buf, &count);|safe
+fs/stat.c|ksu_handle_stat(&dfd, &filename, &flag);|safe
+drivers/tty/pty.c|ksu_handle_devpts((struct inode *)file->f_path.dentry->d_inode);|safe
+drivers/input/input.c|ksu_handle_input_handle_event(&type, &code, &value);|safe
+T55SITES
+        if [ "$t55_bad" != "0" ]; then
+            echo "FATAL: [t55] at least one legacy KSU call site can still be reached on the 4.x line."
+            exit 1
+        fi
+        if [ "$t55_n" != "6" ]; then
+            echo "FATAL: [t55] the routing gate only checked $t55_n call sites, expected 6."
+            exit 1
+        fi
+        # Evidence that the mismatch is real (not a guess): the 4.x definition takes 3
+        # parameters, while the kernel tree called it with 5.
+        if ! grep -qE '^long ksu_handle_execveat_sucompat\(const char __user \*\*filename_user, int orig_nr, struct pt_regs \*regs\)' KernelSU/kernel/feature/sucompat.c; then
+            echo "FATAL: [t55] cannot confirm the 3-arg 4.x signature of ksu_handle_execveat_sucompat() - the convention-mismatch evidence is gone."
+            exit 1
+        fi
+        echo "t55 legacy KSU call sites neutralised on the 4.x line: 6 call sites gone from fs/{open,read_write,stat,exec}.c + drivers/{tty/pty,input/input}.c."
+        echo "t55 routing gate passed: no kernel-tree call site can reach a 4.x function with the 3.x convention (sucompat sites absent, 4.x 3-arg signature confirmed)."
+    else
+        echo "NOTE: KernelSU/kernel/hook/syscall_event_bridge.c not present (3.x SUSFS tree) - the kernel tree keeps its own legacy KSU call sites, which match that line's sucompat.c convention."
+    fi
 else
     echo "KSU is disabled"
 fi
