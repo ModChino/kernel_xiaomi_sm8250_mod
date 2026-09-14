@@ -641,7 +641,7 @@ KSU419HDR
     # selinux_state.policy / status_lock / status_page, struct selinux_policy),
     # seccomp arch cache 5.9 (struct seccomp.filter_count, SECCOMP_ARCH_NATIVE_NR),
     # vdso clock spoof 5.2 (struct clocksource.vdso_clock_mode).
-    if [ -f KernelSU/kernel/selinux/selinux.c ]; then
+    if [ -f KernelSU/kernel/selinux/selinux.c ] && [ -f KernelSU/kernel/feature/selinux_hide.c ] && [ -f KernelSU/kernel/infra/seccomp_cache.c ] && [ -f KernelSU/kernel/feature/cpu_spoof.c ] && [ -f KernelSU/kernel/policy/allowlist.c ] && [ -f KernelSU/kernel/manager/pkg_observer.c ] && [ -f KernelSU/kernel/supercall/dispatch.c ] && [ -f KernelSU/kernel/policy/app_profile.c ] && [ -f KernelSU/kernel/selinux/rules.c ] && [ -f KernelSU/kernel/selinux/sepolicy.c ]; then
         KSUK=KernelSU/kernel
 
 
@@ -857,7 +857,20 @@ T40SPOOF
             echo "FATAL: [$DIS] is missing the t40 task/sched includes."
             exit 1
         fi
+        # t46/P1: policy/app_profile.c also touches a 5.x seccomp member
+        # (struct seccomp.filter_count, added with the 5.9 seccomp arch cache), which
+        # t40 missed - it only stubbed infra/seccomp_cache.c. On 4.19 the counter does
+        # not exist, so the reset is simply skipped (nothing else reads it here).
+        AP="$KSUK/policy/app_profile.c"
+        if ! grep -q 't46: struct seccomp.filter_count is 5.9+' "$AP"; then
+            sed -i 's|^\([[:space:]]*\)atomic_set(&current->seccomp.filter_count, 0);$|\1/* t46: struct seccomp.filter_count is 5.9+; 4.19 has no such counter. */\n\1#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n\1atomic_set(\&current->seccomp.filter_count, 0);\n\1#endif|' "$AP"
+        fi
+        if ! grep -q 't46: struct seccomp.filter_count is 5.9+' "$AP"; then
+            echo "FATAL: [$AP] still touches struct seccomp.filter_count unguarded (5.9+ member)."
+            exit 1
+        fi
         echo "4.19 misc fixes applied: copy_from_user_nofault shim, put_task_struct include, fallthrough idiom, fsnotify handle_event adapter, task/sched includes."
+        echo "4.19 app_profile seccomp fix applied: filter_count reset guarded at 5.9."
 
         # t43/F1: mechanical per-stub ARITY gate. A stub definition whose parameter
         # list disagrees with the prototype visible in the same TU is a hard error
@@ -868,6 +881,22 @@ T40SPOOF
         # every stubbed symbol's parameter count is compared against its header
         # declaration, and any mismatch fails the build. HARD RULE: a stub signature
         # must be character-for-character identical to its header declaration.
+        # t46/P1: the prepended version gate must see LINUX_VERSION_CODE/KERNEL_VERSION
+        # before its first use. run7 showed a gate sitting above the file's own
+        # #include <linux/version.h> is a hard -Werror,-Wundef failure (18 of the 22
+        # errors: 3 per file x 6 files). This post-pass prepends the include to line 1,
+        # i.e. above both the t40 comment and the gate, and is idempotent.
+        for t46_vf in "$SEL" "$KSUK/selinux/rules.c" "$KSUK/selinux/sepolicy.c" "$SHIDE" "$SCC" "$CSP"; do
+            if ! grep -q 'include <linux/version.h> /\* t46' "$t46_vf"; then
+                sed -i -e '1i #include <linux/version.h> /* t46: the t40 gate below needs LINUX_VERSION_CODE/KERNEL_VERSION before the file includes */' "$t46_vf"
+            fi
+            if ! grep -q 'include <linux/version.h> /\* t46' "$t46_vf"; then
+                echo "FATAL: [t46] [$t46_vf] did not get the <linux/version.h> include for its version gate."
+                exit 1
+            fi
+        done
+        echo "t46 version-macro include prepass applied to 6 gated files."
+
         t43_arity() { # $1 = file to scan, $2 = symbol -> prints the parameter count
             awk -v s="$2" '
               { buf = buf " " $0 }
@@ -905,7 +934,7 @@ T40SPOOF
                 echo "FATAL: [t43] stub arity mismatch for $t43_sym: header($t43_hdr)=$t43_a, stub=$t43_b"
                 t43_bad=1
             fi
-        done <<'T43LIST'
+        done < <(tee "$T43TMP/list.txt" <<'T43LIST'
 setup_selinux selinux/selinux.h selinux.stubs
 setenforce selinux/selinux.h selinux.stubs
 getenforce selinux/selinux.h selinux.stubs
@@ -946,7 +975,7 @@ ksu_seccomp_clear_cache infra/seccomp_cache.h seccomp.stubs
 ksu_seccomp_allow_cache infra/seccomp_cache.h seccomp.stubs
 ksu_set_spoof_cpu feature/cpu_spoof.h spoof.stubs
 T43LIST
-        rm -rf "$T43TMP"
+)
         if [ "$t43_bad" != "0" ]; then
             echo "FATAL: [t43] at least one t40 stub disagrees with its header prototype (see the [arity] lines above)."
             exit 1
@@ -956,9 +985,54 @@ T43LIST
             exit 1
         fi
         echo "4.19 stub arity gate passed: $t43_n stubs match their header prototypes."
+
+        # t46/P2-1: -Wundef position gate. The prepended version gate must see
+        # LINUX_VERSION_CODE/KERNEL_VERSION before its first use: run7 proved that a
+        # gate placed above the file's own #include <linux/version.h> is a hard
+        # -Werror,-Wundef failure (18 of run7's 22 errors, 3 per file x 6 files).
+        for t46_f in "$SEL" "$KSUK/selinux/rules.c" "$KSUK/selinux/sepolicy.c" "$SHIDE" "$SCC" "$CSP"; do
+            t46_first=$(grep -nE '#[[:space:]]*(if|elif).*LINUX_VERSION_CODE' "$t46_f" | head -1 | cut -d: -f1)
+            t46_inc=$(grep -n '#include <linux/version.h>' "$t46_f" | head -1 | cut -d: -f1)
+            if [ -z "${t46_first:-}" ]; then
+                echo "FATAL: [t46] [$t46_f] has no version-gated block."
+                exit 1
+            fi
+            if [ -z "${t46_inc:-}" ] || [ "$t46_inc" -ge "$t46_first" ]; then
+                echo "FATAL: [t46] [$t46_f] uses LINUX_VERSION_CODE at line $t46_first but includes <linux/version.h> at line ${t46_inc:-never} (-Wundef would fire)."
+                exit 1
+            fi
+        done
+        echo "t46 version-gate position gate passed: all 6 gated files include <linux/version.h> before their first version-macro use."
+
+        # t46/P2-3: every stub actually defined in the stub blocks must be registered in
+        # the arity list, otherwise a newly added stub would silently escape the gate.
+        awk -F'(' '/^[a-zA-Z_]/ && !/^static/ && NF > 1 { n = split($1, a, /[ \t]/); nm = a[n]; sub(/^\*/, "", nm); print nm }' "$T43TMP"/*.stubs | sort -u > "$T43TMP/defined.txt"
+        cut -d' ' -f1 "$T43TMP/list.txt" | sort -u > "$T43TMP/listed.txt"
+        if [ -n "$(comm -23 "$T43TMP/defined.txt" "$T43TMP/listed.txt")" ]; then
+            echo "FATAL: [t46] these stubs are defined but not registered in the arity list:"
+            comm -23 "$T43TMP/defined.txt" "$T43TMP/listed.txt" | sed 's/^/   /'
+            exit 1
+        fi
+        echo "t46 stub registration gate passed: every defined stub is registered."
+        rm -rf "$T43TMP"
     else
-        echo "NOTE: KernelSU/kernel/selinux/selinux.c not present (3.x SUSFS tree) - the t40 stubs are not needed."
+        echo "NOTE: the 4.x-only KernelSU files (selinux/*, feature/selinux_hide.c, infra/seccomp_cache.c, feature/cpu_spoof.c, policy/allowlist.c, policy/app_profile.c, manager/pkg_observer.c, supercall/dispatch.c) are not present (3.x SUSFS tree) - the t40 stubs and misc fixes are not needed."
     fi
+
+    # t46/P2-2: B-leg (3.x SUSFS tree) coverage gate - deliberately OUTSIDE the guarded
+    # block above, so it runs on both lines: it inspects this script's own text and
+    # requires every 4.x-only file it handles to sit behind a `[ -f ... ]` test.
+    # run7's B leg died after ~2 minutes on feature/selinux_hide.c precisely because
+    # that handling had no existence guard (a runtime check inside the guarded block
+    # could never catch its own missing guard).
+    t46_self="${0:-build.sh}"
+    for t46_p in KernelSU/kernel/selinux/selinux.c KernelSU/kernel/selinux/rules.c KernelSU/kernel/selinux/sepolicy.c KernelSU/kernel/feature/selinux_hide.c KernelSU/kernel/infra/seccomp_cache.c KernelSU/kernel/feature/cpu_spoof.c KernelSU/kernel/policy/allowlist.c KernelSU/kernel/policy/app_profile.c KernelSU/kernel/manager/pkg_observer.c KernelSU/kernel/supercall/dispatch.c; do
+        if ! grep -qF -- "[ -f $t46_p ]" "$t46_self"; then
+            echo "FATAL: [t46] [$t46_p] is handled without a [ -f ... ] existence guard (the 3.x tree would abort)."
+            exit 1
+        fi
+    done
+    echo "t46 B-leg guard coverage gate passed: all 10 handled 4.x-only files sit behind existence tests."
 else
     echo "KSU is disabled"
 fi
