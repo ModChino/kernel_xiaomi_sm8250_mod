@@ -1472,6 +1472,16 @@ set -u
 rc_all=0
 fail() { echo "FATAL: [cline] $*"; exit 1; }
 
+# --- 0) keep the pre-transform copies the structural gates compare against ---------
+# The gates in section 6 need to know what each `#ifdef CONFIG_KSU` block looked like
+# BEFORE the transformation, so they can distinguish "this block legitimately has no ksu_
+# call (a self-closing guard)" from "this block lost the call it used to have".
+mkdir -p out/.cline/pre
+for f in fs/exec.c fs/read_write.c fs/stat.c fs/open.c drivers/input/input.c; do
+    [ -e "$f" ] || continue
+    cp "$f" "out/.cline/pre/$(echo "$f" | sed 's|/|_|g')"
+done
+
 # --- 1) strip the in-tree SUSFS 1.5.7 -----------------------------------------
 # The fork's baseline already carries SUSFS 1.5.7 (fs/susfs.c, fs/sus_su.c,
 # include/linux/susfs.h + hooks in 22 files), and SUSFS 2.2.0 replaces exactly those
@@ -1535,15 +1545,112 @@ CLINE_MARK='cline: 4.x inline hook'
 # oopsed on the device (regs=NULL -> NULL+0x10). ReSukiSU reaches execveat through
 # kernel/hook/syscall_event_bridge.c (3-arg convention), so the kernel tree must not
 # keep a second call site with the 3.x convention.
+#
+# run12 defect: deleting the three 3.x lines ONE BY ONE left the `else` behind and the
+# file stopped compiling - `fs/exec.c:1954: error: expected expression` immediately
+# before `else`. The removal is therefore a whole *address-range* deletion (the two
+# `if (…ksu_execveat_hook…)` blocks, from the `if` through the line after the block's
+# closing `#endif`), not a line-by-line string deletion. The pristine layout is:
+#
+#     #ifdef CONFIG_KSU
+#     extern bool ksu_execveat_hook __read_mostly;
+#     extern int ksu_handle_execveat(...);
+#     extern int ksu_handle_execveat_sucompat(...);
+#     #endif
+#     ...
+#     #ifdef CONFIG_KSU
+#     	if (unlikely(ksu_execveat_hook))                                     <- start
+#     		ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+#     	else
+#     		ksu_handle_execveat_sucompat((int *)AT_FDCWD, &filename, NULL, NULL, NULL);
+#     #endif                                                               <- end
+#
+# The 32-bit variant (`if (!ksu_execveat_hook)` + one call + `#endif`) is the same shape.
+# The extern declarations for the two 3.x names go as well (the 2.x tree declares its own
+# ksu_handle_execveat; leaving the old-flag extern would re-introduce the symbol).
 if ! grep -q 'cline: 4.x inline hook (exec)' fs/exec.c; then
-    sed -i '/^[[:space:]]*if (unlikely(ksu_execveat_hook))$/d' fs/exec.c
-    sed -i '/^[[:space:]]*if (!ksu_execveat_hook)$/d' fs/exec.c
-    sed -i '/^[[:space:]]*ksu_handle_execveat_sucompat((int \*)AT_FDCWD, &filename, NULL, NULL, NULL);/d' fs/exec.c
-    sed -i '/^extern bool ksu_execveat_hook __read_mostly;$/d' fs/exec.c
-    sed -i '/^extern int ksu_handle_execveat_sucompat(int \*fd, struct filename \*\*filename_ptr,$/d' fs/exec.c
-    sed -i '/^[[:space:]]*void \*argv, void \*envp, int \*flags);$/d' fs/exec.c
-    sed -i '0,/^#ifdef CONFIG_KSU$/s|^#ifdef CONFIG_KSU$|/* cline: 4.x inline hook (exec): the 3.x flag branch is gone; ReSukiSU reaches\n * execveat through kernel/hook/syscall_event_bridge.c with its own convention. */\n#ifdef CONFIG_KSU|' fs/exec.c
+    rm -f fs/exec.c.cline.cnt
+    # Every pattern below tolerates a trailing CR: this fork's tree is CRLF/LF MIXED
+    # (fs/namei.c = 2648 CRLF + 2531 bare LF), so an `$`-anchored pattern silently
+    # fails on the CRLF lines - that is exactly how the first version of this block
+    # managed to delete the `if` but not the `else`.
+    awk '
+        /^[[:space:]]*if \(unlikely\(ksu_execveat_hook\)\)[[:space:]]*$/ { skip = 1 }
+        /^[[:space:]]*if \(!ksu_execveat_hook\)[[:space:]]*$/            { skip = 1 }
+        skip {
+            if ($0 ~ /^[[:space:]]*#endif[[:space:]]*$/) { skip = 0; deleted++ }
+            next
+        }
+        /^extern bool ksu_execveat_hook __read_mostly;[[:space:]]*$/ { next }
+        /^extern int ksu_handle_execveat_sucompat\(int \*fd, struct filename \*\*filename_ptr,[[:space:]]*$/ { next }
+        /^[[:space:]]*void \*argv, void \*envp, int \*flags\);[[:space:]]*$/ { next }
+        /^#ifdef CONFIG_KSU[[:space:]]*$/ && !marked {
+            print $0 " /* cline: 4.x inline hook (exec) */"; marked = 1; next
+        }
+        { print }
+        END { printf "%d\n", deleted > "/dev/stderr" }
+    ' fs/exec.c > fs/exec.c.cline 2> fs/exec.c.cline.cnt
+    awk_deleted=$(cat fs/exec.c.cline.cnt 2>/dev/null || echo 0)
+    rm -f fs/exec.c.cline.cnt
+    if [ "$awk_deleted" != 2 ]; then
+        rm -f fs/exec.c.cline
+        fail "fs/exec.c: expected exactly 2 executable 3.x hook blocks, found [$awk_deleted]"
+    fi
+    mv fs/exec.c.cline fs/exec.c
 fi
+# 3a-2) install the 2.x entry point at the same two places. The reference port
+# (Zhanfg/kernel_oneplus_sdm845 @ abca07ff, 4.19.325 + ReSukiSU + SUSFS 2.2.0) calls
+# `ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags)` from do_execve(); the
+# signature is character-for-character ReSukiSU's feature/sucompat.c:316. Without a call
+# the extern would be declaration-only: no compile error, but no execveat hook either
+# (and `inline_hook_check.mk` would only be satisfied by the declaration string).
+#
+# The insertion point is the `return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);`
+# line that DIRECTLY follows the `#ifdef CONFIG_KSU` marker. The two `do_execve` wrappers
+# have that shape; `do_execveat` / `compat_do_execveat` carry an extra `fd`/`flags` and
+# their return does not sit under the guard, so an earlier version of this rule (matching
+# on the return line alone) wrongly injected the call into `do_execveat`. The same pass
+# removes the 3.x three-line extern declaration block.
+if ! grep -q 'cline: 4.x inline hook (exec) call (' fs/exec.c; then
+    awk '
+        # delete the 3.x declaration block as a unit: extern + continuation + `#endif`
+        /^extern int ksu_handle_execveat_sucompat\(int \*fd, struct filename \*\*filename_ptr,$/ { dcl = 1; next }
+        dcl {
+            if ($0 ~ /^[[:space:]]*void \*argv, void \*envp, int \*flags\);[[:space:]]*$/) { next }
+            if ($0 ~ /^[[:space:]]*#endif[[:space:]]*$/) { dcl = 0; next }
+            dcl = 0
+        }
+        /^#ifdef CONFIG_KSU[[:space:]]*$/ { guard = 1; print; next }
+        guard && /^[[:space:]]*return do_execveat_common\(AT_FDCWD, filename, argv, envp, 0\);[[:space:]]*$/ {
+            print "\t/* cline: 4.x inline hook (exec) call (signature = feature/sucompat.c:316) */"
+            print "\t{"
+            print "\t\tint t49_fd = AT_FDCWD;"
+            print "\t\tksu_handle_execveat(&t49_fd, &filename, &argv, &envp, 0);"
+            print "\t}"
+            print ""
+            print
+            inserted++
+            guard = 0
+            next
+        }
+        { if ($0 !~ /^[[:space:]]*$/) guard = 0; print }
+        END { printf "%d\n", inserted > "/dev/stderr" }
+    ' fs/exec.c > fs/exec.c.cline2 2> fs/exec.c.cline2.cnt
+    exec_inserted=$(cat fs/exec.c.cline2.cnt 2>/dev/null || echo 0)
+    rm -f fs/exec.c.cline2.cnt
+    if [ "$exec_inserted" != 2 ]; then
+        rm -f fs/exec.c.cline2
+        fail "fs/exec.c: expected the 2.x execveat call to be installed in exactly 2 functions, installed in [$exec_inserted]"
+    fi
+    mv fs/exec.c.cline2 fs/exec.c
+fi
+grep -q 'cline: 4.x inline hook (exec) call (' fs/exec.c || fail "fs/exec.c: the 2.x execveat call site was not installed"
+# the signature must be ReSukiSU's, not the 3.x one (the device oops was this exact mix-up)
+grep -q '^extern int ksu_handle_execveat(int \*fd, struct filename \*\*filename_ptr, void \*argv,' fs/exec.c \
+    || fail "fs/exec.c: the kernel tree's 4.x ksu_handle_execveat extern is not the expected signature"
+# and the call must exist, not just the declaration (that was the run12 shape)
+[ "$(grep -c 'ksu_handle_execveat(&t49_fd, &filename, &argv, &envp, 0);' fs/exec.c)" = 2 ] \
+    || fail "fs/exec.c: the 2.x execveat call is not present in both functions"
 if ! grep -q 'cline: 4.x inline hook (exec)' fs/exec.c; then
     fail "fs/exec.c: the 4.x execveat conversion marker was not written"
 fi
@@ -1605,6 +1712,42 @@ if ! grep -q 'ksu_handle_sys_reboot' kernel/reboot.c; then
         }' kernel/reboot.c > kernel/reboot.c.cline && mv kernel/reboot.c.cline kernel/reboot.c
 fi
 grep -q 'ksu_handle_sys_reboot' kernel/reboot.c || fail "kernel/reboot.c has no ksu_handle_sys_reboot call site"
+
+# 3f) fs/proc/task_mmu.c - run12 defect 2. The upstream SUSFS 2.2.0 patch declares
+# `spoofed_redirected_name` TWICE in show_map_vma():
+#   :374  function level, inside `#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT`   (outer)
+#   :381  inside `if (SUSFS_IS_INODE_OPEN_REDIRECT(inode)) {`             (inner)
+# The inner declaration SHADOWS the outer one and the outer is never referenced, so
+# clang reports `unused variable 'spoofed_redirected_name' [-Werror,-Wunused-variable]`
+# and the build stops at fs/proc/task_mmu.o. Only the outer one is removed: the inner
+# declaration and its two uses (`susfs_open_redirect_spoof_show_map_vma_srcu(...,
+# &spoofed_redirected_name)` and `seq_puts(m, spoofed_redirected_name)`) stay, so the
+# open_redirect feature still works - unlike silencing the warning or disabling
+# CONFIG_KSU_SUSFS_OPEN_REDIRECT, both of which are forbidden here.
+#
+# The file is touched by the 2.2.0 patch ONLY (this transform had no task_mmu rule before),
+# so the guard is: the outer declaration exists AND the inner one exists.
+if ! grep -q 'cline: 4.x task_mmu duplicate' fs/proc/task_mmu.c; then
+    tm_outer=$(grep -c '^	char \*spoofed_redirected_name = NULL;[[:space:]]*$' fs/proc/task_mmu.c)
+    tm_inner=$(grep -c '^			char \*spoofed_redirected_name = NULL;[[:space:]]*$' fs/proc/task_mmu.c)
+    if [ "$tm_outer" = 1 ] && [ "$tm_inner" = 1 ]; then
+        # replace the declaration in place with a comment: idempotent even if a later step
+        # fails, because the comment carries the marker
+        sed -i 's|^	char \*spoofed_redirected_name = NULL;[[:space:]]*$|	/* cline: 4.x task_mmu duplicate: the function-level declaration is shadowed by the\n	 * one inside the SUSFS_IS_INODE_OPEN_REDIRECT() block and is never read, which is a\n	 * -Werror,-Wunused-variable error. Only this outer copy is removed. */|' fs/proc/task_mmu.c
+        # the now-empty #ifdef/#endif pair goes with it (this patch writes the #endif in
+        # the `#endif // #ifdef …` form, so that shape is matched)
+        sed -i '/^#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT[[:space:]]*$/{N;/\n[[:space:]]*#endif \/\/ #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT[[:space:]]*$/d}' fs/proc/task_mmu.c
+    fi
+fi
+if grep -q 'cline: 4.x task_mmu duplicate' fs/proc/task_mmu.c; then
+    tm_outer=$(grep -c '^	char \*spoofed_redirected_name = NULL;[[:space:]]*$' fs/proc/task_mmu.c)
+    tm_refs=$(grep -c 'spoofed_redirected_name' fs/proc/task_mmu.c)
+    [ "$tm_outer" = 0 ] || fail "fs/proc/task_mmu.c still has the unused function-level spoofed_redirected_name"
+    [ "$tm_refs" -ge 3 ] || fail "fs/proc/task_mmu.c: the inner declaration/uses were removed too (refs=$tm_refs)"
+    echo "[cline] fs/proc/task_mmu.c: removed the shadowed function-level declaration (still $tm_refs references)."
+else
+    fail "fs/proc/task_mmu.c: the SUSFS 2.2.0 duplicate-declaration defect was not handled (outer=$tm_outer inner=$tm_inner)"
+fi
 
 # --- 4) KSU-side 4.19 compat --------------------------------------------------
 # 4a) copy_to_user_nofault()/copy_from_user_nofault() are 5.8+; this tree spells them
@@ -1679,6 +1822,89 @@ for cline_pair in "kernel/sys.c:ksu_handle_setresuid" "fs/exec.c:ksu_handle_exec
     }
 done
 [ "$cline_hook_fail" = 0 ] || fail "the 4.x inline-hook contract is not routable (see the lines above; KernelSU/kernel/tools/inline_hook_check.mk would fail the build)"
+
+# --- 6) STRUCTURAL gates (not string gates) -----------------------------------
+# run12 taught the difference the hard way: the string gates in section 3a passed while
+# fs/exec.c no longer compiled, because `ksu_execveat_hook` still appeared in the COMMENT
+# that step had just inserted, and because "no dangling else" was never checked at all.
+# Both gates below look at structure, so a comment cannot satisfy them.
+
+# 6a) a dangling `else` must never be produced. This is the exact run12 defect
+# (`fs/exec.c:1954: error: expected expression` immediately before `else`).
+#
+# The discriminator is BRACE DEPTH, not "the previous line ends with }": a legitimate
+# `else` can follow a multi-line if-body whose last line is an assignment (which is why
+# a naive check produced five false positives on the first run of this gate). A dangling
+# `else` always sits at depth 0 with at least one code brace already opened and closed on
+# the way in, i.e. there is no `if` it can belong to. `#else` and `else if` are excluded
+# by the pattern itself, and a `\r` is stripped first because this tree is CRLF/LF mixed.
+for cline_f in fs/exec.c fs/read_write.c fs/stat.c fs/open.c drivers/input/input.c kernel/reboot.c kernel/sys.c; do
+    [ -e "$cline_f" ] || continue
+    cline_bad=$(awk '
+        { sub(/\r$/, "", $0) }
+        /^[[:space:]]*else[[:space:]]*$/ && depth == 0 && closed > 0 { printf "%d:%s\n", NR, $0 }
+        {
+            opens = gsub(/\{/, "{")
+            closes = gsub(/\}/, "}")
+            depth += opens - closes
+            if (depth < 0) depth = 0
+            if (closes > 0 && depth == 0) closed++
+        }
+    ' "$cline_f")
+    if [ -n "$cline_bad" ]; then
+        echo "   dangling else in $cline_f:"
+        echo "$cline_bad" | sed 's/^/      /'
+        fail "a dangling else was produced in $cline_f (this is the run12 compile error)"
+    fi
+done
+echo "[cline] structural gate: no dangling else in any touched file."
+
+# 6b) UNIT-DELETION gate for the 3.x hook blocks.
+# The run12 defect was an `else` whose `if` had been deleted (and my first two attempts
+# at this gate were both wrong: a string gate passed because the symbol survived in a
+# comment, and a brace-balance gate passed because the dangling `else`'s body had been
+# deleted too, leaving a net balance of zero on both `block` and `file`).
+#
+# The invariant that actually holds is: a brace-less control keyword and the statement it
+# owns are deleted together. So inside every `#ifdef CONFIG_KSU` block, if a brace-less
+# `else` survives, a brace-less `if` must survive as well. Validated against seven
+# crafted inputs by _recon3/gate_else_test.sh:
+#   buggy (only the `if` line removed)  -> FIRE  "1 brace-less else but 0 brace-less if"
+#   buggy (only the body call removed)  -> PASS  (the `if`/`else` pair is still intact)
+#   fixed (whole block removed)         -> PASS
+#   pristine 1.5.7                      -> PASS
+#   a multi-line if-body + else         -> PASS
+#   an if/else-if/else chain            -> PASS
+#   a synthetic dangling else           -> FIRE
+for cline_f in fs/exec.c fs/read_write.c fs/stat.c fs/open.c drivers/input/input.c; do
+    [ -e "$cline_f" ] || continue
+    cline_bad=$(awk '
+        function flush(   i, kopen, kclose, calls) {
+            kopen = 0; kclose = 0; calls = 0
+            for (i in sdepth) { if (sdepth[i] == "if") kopen++; if (sdepth[i] == "else") kclose++ }
+            for (i in clines) calls++
+            if (calls > 0 && kclose > 0 && kopen == 0)
+                printf "KSU block at line %d: %d brace-less else but %d brace-less if (call lines:%s)\n", start, kclose, kopen, calltext
+            delete sdepth; delete clines; calltext = ""
+        }
+        { gsub(/\r/, "") }
+        { o = gsub(/\{/, "{"); c = gsub(/\}/, "}")
+          depth += o - c
+          if (depth < 0) depth = 0 }
+        /^[[:space:]]*#ifdef CONFIG_KSU[[:space:]]*$/ { inb = 1; start = NR; delete sdepth; delete clines; calltext = ""; next }
+        inb {
+            if ($0 ~ /^[[:space:]]*#endif/) { flush(); inb = 0; next }
+            if ($0 ~ /^[[:space:]]*else([[:space:]]+if[[:space:]]*\(.*\))?[[:space:]]*$/) sdepth[depth - 1] = "else"
+            else if ($0 ~ /^[[:space:]]*(if|for|while|switch)[[:space:]]*\(/) sdepth[depth] = "if"
+            if ($0 ~ /(^|[^_a-zA-Z0-9])ksu_[a-zA-Z0-9_]*\(/) { clines[NR] = 1; calltext = calltext " " NR }
+        }
+    ' "$cline_f")
+    if [ -n "$cline_bad" ]; then
+        echo "   $cline_f: $cline_bad"
+        fail "a 3.x hook block was deleted non-atomically in $cline_f (an else survived without its if - this is the run12 compile error)"
+    fi
+done
+echo "[cline] structural gate: every 3.x hook block was deleted atomically (no else without its if)."
 
 echo "[cline] kernel tree transformed: SUSFS 2.2.0 applied, 1.5.7 stripped, KSU 4.19 compat in place."
 CLINE_TRANSFORM_EOF
