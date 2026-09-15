@@ -1,9 +1,15 @@
-name: Build enuma kernel (SukiSU dual-line)
+name: Build enuma kernel (SukiSU dual-line + ReSukiSU C line)
 
-# Builds both KernelSU lines of the enuma (Xiaomi Pad 5 Pro 5G) MIUI kernel:
+# Builds every KernelSU line of the enuma (Xiaomi Pad 5 Pro 5G) MIUI kernel:
 #   susfs=0 -> clean line, SukiSU v4.2.0 (4.x, metamodule capable)
 #   susfs=1 -> SUSFS line, KernelSU with the in-kernel SUSFS 1.5.7 glue
+#   susfs=2 -> C line, ReSukiSU 4.x with SUSFS 2.2.0 (kernel side applied by build.sh
+#              on top of this tree's own 1.5.7 code, which it strips first)
 # Each job produces one anykernel3 zip named Kernel_MIUI_enuma_*.
+#
+# The three jobs are independent checkouts (one per matrix arm), which is a hard
+# requirement for susfs=2: its first step rewrites fs/ + include/linux/ + kernel/ on
+# the tree, and running it in the same workspace as susfs=0/1 would corrupt them.
 #
 # Scope (t3/M1): only the MIUI variant is built and verified here - every job of
 # this workflow pins MIUI_ONLY=1. build.sh's AOSP block (MIUI_ONLY=0) is NOT
@@ -32,6 +38,11 @@ on:
         options:
           - "1"
           - "0"
+      susfs:
+        description: "Which KernelSU line(s) to build as a JSON list (0=clean, 1=SukiSU+SUSFS1.5.7, 2=ReSukiSU+SUSFS2.2.0)"
+        required: false
+        default: "[0, 1, 2]"
+        type: string
 
 permissions:
   contents: read
@@ -48,7 +59,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        susfs: [0, 1]
+        # Default builds every line; the workflow_dispatch input can narrow it (a
+        # cold C-line job is ~25 minutes on its own, so being able to build just it
+        # matters). The default is a JSON list because that is what fromJSON consumes.
+        susfs: ${{ fromJSON(github.event.inputs.susfs || '[0, 1, 2]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -143,10 +157,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Kernel_MIUI_enuma_susfs${{ matrix.susfs }}-${{ github.run_number }}
-          # t3/M2: one glob per line. "Kernel_MIUI_enuma_SukiSU_*" (susfs=0) and
-          # "Kernel_MIUI_enuma_SukiSU-SUSFS_*" (susfs=1) are disjoint, so an
-          # artifact can never contain the other line's zip.
-          path: Kernel_MIUI_enuma_SukiSU${{ matrix.susfs == 1 && '-SUSFS' || '' }}_*.zip
+          # One glob, and the three product names are disjoint:
+          #   susfs=0 -> Kernel_MIUI_enuma_SukiSU_*
+          #   susfs=1 -> Kernel_MIUI_enuma_SukiSU-SUSFS_*
+          #   susfs=2 -> Kernel_MIUI_enuma_ReSukiSU-SUSFS2_*
+          # (they come from build.sh's KSU_ZIP_STR, and the disjointness is checked by
+          # the verification task). Anchoring on the prefix keeps exactly one arm's zip
+          # in each artifact and cannot silently pick up another line's zip.
+          path: Kernel_MIUI_enuma_*.zip
           if-no-files-found: ${{ matrix.susfs == 0 && 'error' || 'ignore' }}
 
       - name: Upload raw build log

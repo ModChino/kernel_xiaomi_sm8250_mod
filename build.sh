@@ -3,17 +3,30 @@
 # Some logics of this script are copied from [scripts/build_kernel]. Thanks to UtsavBalar1231.
 #
 # ---------------------------------------------------------------------------
-# enuma (Xiaomi Pad 5 Pro 5G) - TWO KernelSU lines in ONE script
+# enuma (Xiaomi Pad 5 Pro 5G) - THREE KernelSU lines in ONE script
 #
 #   MIUI_ONLY=1 (default) build only the MIUI variant, the AOSP block is skipped
 #   WITH_SUSFS=0 (default) clean line : SukiSU-Ultra/SukiSU-Ultra v4.2.0  (4.x)
 #                          -> Kernel_MIUI_enuma_SukiSU_*_anykernel3_*.zip
 #   WITH_SUSFS=1           SUSFS line : KernelSU carrying the SUSFS 1.5.x glue
 #                          -> Kernel_MIUI_enuma_SukiSU-SUSFS_*_anykernel3_*.zip
+#   WITH_SUSFS=2           C line     : ReSukiSU 4.x (KSU side) + SUSFS 2.2.0
+#                          (kernel side, applied by this script on top of the fork's
+#                          own 1.5.7 code, which is stripped first)
+#                          -> Kernel_MIUI_enuma_ReSukiSU-SUSFS2_*_anykernel3_*.zip
 #
 # Usage:
 #     MIUI_ONLY=1 WITH_SUSFS=0 bash build.sh enuma ksu
 #     MIUI_ONLY=1 WITH_SUSFS=1 bash build.sh enuma ksu
+#     MIUI_ONLY=1 WITH_SUSFS=2 bash build.sh enuma ksu
+#
+# KernelSU sources - all pinned to immutable commits:
+#   clean line : 85eb4a95b8a61d756ecf53b9c5785e48e1b15039 = tag v4.2.0
+#   SUSFS line : f4863b20cc8dc0f8cc67418980f022e43014b598 = liyafe1997/SukiSU-Ultra "susfs-1.5.7"
+#   C line     : f7be4a53bd39d4a03876eba5e888818b1a1fcaac = ReSukiSU/ReSukiSU, the
+#                commit behind the reference build's "v4.1.0-f7be4a53+3a62be00@ReSukiSU".
+#                NOTE: the v4.1.0 TAG (0d27e685, 2025-12-05) is a flat, older layout
+#                without KSU_SUSFS - do not pin the tag.
 #
 # KernelSU sources - both pinned to immutable commits:
 #   clean line : 85eb4a95b8a61d756ecf53b9c5785e48e1b15039 = tag v4.2.0
@@ -64,7 +77,9 @@ TARGET_DEVICE=$1
 
 # ---- build line switches ---------------------------------------------------
 # MIUI_ONLY: 1 (default) = build the MIUI variant only, skip the AOSP block
-# WITH_SUSFS: 0 (default) = clean SukiSU v4.2.0 line, 1 = SUSFS line
+# WITH_SUSFS: 0 (default) = clean SukiSU v4.2.0 line
+#             1           = SukiSU 3.x + in-tree SUSFS 1.5.7 line
+#             2           = C line: ReSukiSU 4.x + SUSFS 2.2.0 (kernel side patched here)
 MIUI_ONLY=${MIUI_ONLY:-1}
 WITH_SUSFS=${WITH_SUSFS:-0}
 
@@ -74,8 +89,8 @@ case "$MIUI_ONLY" in
 esac
 
 case "$WITH_SUSFS" in
-    0|1) ;;
-    *) echo "WITH_SUSFS must be 0 or 1 (got: [$WITH_SUSFS])"; exit 1 ;;
+    0|1|2) ;;
+    *) echo "WITH_SUSFS must be 0, 1 or 2 (got: [$WITH_SUSFS]); 2 = the ReSukiSU + SUSFS 2.2.0 C line"; exit 1 ;;
 esac
 
 # ---- KernelSU sources (immutable commits) ----------------------------------
@@ -84,6 +99,14 @@ KSU_REF_CLEAN=85eb4a95b8a61d756ecf53b9c5785e48e1b15039
 # SUSFS line: liyafe1997/SukiSU-Ultra branch susfs-1.5.7 (matches this tree's
 # in-kernel SUSFS 1.5.7 fs-side code)
 KSU_REF_SUSFS=f4863b20cc8dc0f8cc67418980f022e43014b598
+# C line: ReSukiSU 4.x. This is the KSU side of the reference build; the kernel side
+# (SUSFS 2.2.0) is downloaded and applied by the C-line block further down.
+KSU_REF_RE=f7be4a53bd39d4a03876eba5e888818b1a1fcaac
+# SUSFS 2.2.0 kernel-side patch (JackA1ltman/NonGKI_Kernel_Build_2nd, the only public
+# 4.19 source; it carries no KSU call sites, which is why the C-line block below adds
+# them itself). blob 4ae50a1264cfde4c2f9ec0d24a17329911445d61, 134634 B.
+SUSFS_220_URL=https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/7caf07c44806c1086ba28236c60722fb5699d2b6/Patches/Patch/susfs_patch_to_4.19.patch
+SUSFS_220_BLOB=4ae50a1264cfde4c2f9ec0d24a17329911445d61
 # Official setup.sh of v4.2.0 (blob 7e57e19b8408c7542865af5076cbee28783b3c7c).
 # It clones https://github.com/SukiSU-Ultra/SukiSU-Ultra (unless a KernelSU/
 # directory already exists), wires it into drivers/ and checks out the ref given
@@ -187,7 +210,9 @@ clang --version
 KSU_ZIP_STR=NoKernelSU
 if [ "${2:-}" = "ksu" ]; then
     KSU_ENABLE=1
-    if [ "$WITH_SUSFS" -eq 1 ]; then
+    if [ "$WITH_SUSFS" -eq 2 ]; then
+        KSU_ZIP_STR=ReSukiSU-SUSFS2
+    elif [ "$WITH_SUSFS" -eq 1 ]; then
         KSU_ZIP_STR=SukiSU-SUSFS
     else
         KSU_ZIP_STR=SukiSU
@@ -224,33 +249,119 @@ forbid_symbol() {
     fi
 }
 
+# ---- C line (WITH_SUSFS=2) config, shared by the AOSP and MIUI blocks ----------
+# The C line's config surface is a different symbol set from the A/B lines':
+#   * SUSFS 2.2.0 declares exactly 10 KSU_SUSFS_* symbols (no HAS_MAGIC_MOUNT, no
+#     SUS_OVERLAYFS, no SUS_SU, no TRY_UMOUNT family) - and no KPM at all;
+#   * KSU_SUSFS is a `choice` arm next to KSU_TRACEPOINT_HOOK / KSU_MANUAL_HOOK, so
+#     selecting it is what makes ReSukiSU use SUSFS inline hooks. If its dependency
+#     (THREAD_INFO_IN_TASK) is missing, Kconfig silently falls back to
+#     KSU_TRACEPOINT_HOOK - which is why every config write is followed by a full
+#     symbol gate rather than just `=y` checks.
+cline_config() {
+    scripts/config --file out/.config \
+        -e KSU \
+        -e KPROBES \
+        -e EXT4_FS \
+        -e KSU_SUSFS \
+        -e KSU_SUSFS_SUS_PATH \
+        -e KSU_SUSFS_SUS_MOUNT \
+        -e KSU_SUSFS_SUS_KSTAT \
+        -e KSU_SUSFS_SPOOF_UNAME \
+        -e KSU_SUSFS_ENABLE_LOG \
+        -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+        -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+        -e KSU_SUSFS_OPEN_REDIRECT \
+        -e KSU_SUSFS_SUS_MAP
+    make $MAKE_ARGS olddefconfig
+    require_config KSU
+    require_config KPROBES
+    require_config EXT4_FS
+    require_config THREAD_INFO_IN_TASK
+    require_config KSU_SUSFS
+    for c in SUS_PATH SUS_MOUNT SUS_KSTAT SPOOF_UNAME ENABLE_LOG HIDE_KSU_SUSFS_SYMBOLS SPOOF_CMDLINE_OR_BOOTCONFIG OPEN_REDIRECT SUS_MAP; do
+        require_config KSU_SUSFS_$c
+    done
+    forbid_config KSU_MANUAL_HOOK
+    forbid_config KSU_TRACEPOINT_HOOK
+    require_config KSU_MULTI_MANAGER_SUPPORT
+    # ReSukiSU has no KPM: the symbol must not exist on the C line at all, which is a
+    # stronger statement than KPM=n (a stray -e KPM would be silently dropped by
+    # olddefconfig and raise no error).
+    forbid_symbol KPM
+    # the version assertion the C line needs on top of `KSU_SUSFS=y`: the tree could
+    # otherwise carry the wrong SUSFS generation and still satisfy every =y gate.
+    if ! grep -q '#define SUSFS_VERSION "v2.2.0"' include/linux/susfs.h; then
+        echo "FATAL: [cline] include/linux/susfs.h does not report SUSFS v2.2.0."
+        exit 1
+    fi
+    echo "[cline] config gates passed: KSU + KSU_SUSFS(2.2.0) + 9 SUSFS features + THREAD_INFO_IN_TASK, KPM absent."
+}
+
 
 echo "TARGET_DEVICE: $TARGET_DEVICE"
 echo "MIUI_ONLY: [$MIUI_ONLY] WITH_SUSFS: [$WITH_SUSFS] KSU: [$KSU_ZIP_STR]"
 
 if [ $KSU_ENABLE -eq 1 ]; then
     echo "KSU is enabled"
-    if [ "$WITH_SUSFS" -eq 1 ]; then
-        KSU_REF=$KSU_REF_SUSFS
-        # The official setup.sh can only clone the official repository, so the
-        # fork tree is fetched here first at its pinned commit; setup.sh then
-        # skips its own clone (test -d "$GKI_ROOT/KernelSU" || git clone ...)
-        # and only performs the wiring + checkout.
-        git clone https://github.com/liyafe1997/SukiSU-Ultra KernelSU
+    if [ "$WITH_SUSFS" -eq 2 ]; then
+        # C line: ReSukiSU. The official SukiSU setup.sh only clones SukiSU-Ultra, so
+        # it cannot produce this tree; the clone is done here at a pinned commit and
+        # its HEAD is verified, because a silently wrong checkout is the failure mode
+        # this project already hit once (`git checkout "$1" || echo` swallowing an
+        # error). ReSukiSU's own kernel/setup.sh (blob below) is then reused verbatim
+        # for the drivers/ wiring - it skips its clone because KernelSU/ exists.
+        KSU_REF=$KSU_REF_RE
+        KSU_SETUP_URL=https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/${KSU_REF}/kernel/setup.sh
+        git clone --filter=blob:none https://github.com/ReSukiSU/ReSukiSU KernelSU
+        git -C KernelSU checkout --detach "$KSU_REF"
+        KSU_HEAD=$(git -C KernelSU rev-parse HEAD)
+        if [ "$KSU_HEAD" != "$KSU_REF" ]; then
+            echo "FATAL: KernelSU is at [$KSU_HEAD] but [$KSU_REF] was requested."
+            exit 1
+        fi
+        echo "KernelSU ref: [$KSU_REF]"
+        curl -LSs "$KSU_SETUP_URL" | bash -s "$KSU_REF"
+        # ReSukiSU's compat/kernel_compat.h includes <ss/policydb.h>; on this 4.19 tree
+        # that private directory is security/selinux/ss, which is NOT in the Kbuild's
+        # own -I list (it stops at security/selinux/include). Append it and gate it.
+        if [ -f KernelSU/kernel/Kbuild ]; then
+            if ! grep -q 'security/selinux/ss' KernelSU/kernel/Kbuild; then
+                sed -i 's|-I\$(srctree)/security/selinux/include|-I$(srctree)/security/selinux/include -I$(srctree)/security/selinux/ss|' KernelSU/kernel/Kbuild
+            fi
+            if ! grep -q 'security/selinux/ss' KernelSU/kernel/Kbuild; then
+                echo "FATAL: [KernelSU/kernel/Kbuild] does not carry -I\$(srctree)/security/selinux/ss."
+                echo "       (ReSukiSU's compat/kernel_compat.h includes <ss/policydb.h>)"
+                exit 1
+            fi
+            echo "KernelSU/kernel/Kbuild: security/selinux/ss include is in place."
+        else
+            echo "FATAL: ReSukiSU tree has no kernel/Kbuild."
+            exit 1
+        fi
     else
-        KSU_REF=$KSU_REF_CLEAN
-    fi
+        if [ "$WITH_SUSFS" -eq 1 ]; then
+            KSU_REF=$KSU_REF_SUSFS
+            # The official setup.sh can only clone the official repository, so the
+            # fork tree is fetched here first at its pinned commit; setup.sh then
+            # skips its own clone (test -d "$GKI_ROOT/KernelSU" || git clone ...)
+            # and only performs the wiring + checkout.
+            git clone https://github.com/liyafe1997/SukiSU-Ultra KernelSU
+        else
+            KSU_REF=$KSU_REF_CLEAN
+        fi
 
-    echo "KernelSU ref: [$KSU_REF]"
-    echo "KernelSU setup: [$KSU_SETUP_URL]"
-    curl -LSs "$KSU_SETUP_URL" | bash -s "$KSU_REF"
+        echo "KernelSU ref: [$KSU_REF]"
+        echo "KernelSU setup: [$KSU_SETUP_URL]"
+        curl -LSs "$KSU_SETUP_URL" | bash -s "$KSU_REF"
 
-    # setup.sh swallows a failed `git checkout <ref>` (git checkout "$1" || echo
-    # "Checkout default branch"), so verify the tree that will really be compiled.
-    KSU_HEAD=$(git -C KernelSU rev-parse HEAD)
-    if [ "$KSU_HEAD" != "$KSU_REF" ]; then
-        echo "FATAL: KernelSU is at [$KSU_HEAD] but [$KSU_REF] was requested."
-        exit 1
+        # setup.sh swallows a failed `git checkout <ref>` (git checkout "$1" || echo
+        # "Checkout default branch"), so verify the tree that will really be compiled.
+        KSU_HEAD=$(git -C KernelSU rev-parse HEAD)
+        if [ "$KSU_HEAD" != "$KSU_REF" ]; then
+            echo "FATAL: KernelSU is at [$KSU_HEAD] but [$KSU_REF] was requested."
+            exit 1
+        fi
     fi
     if [ ! -e drivers/kernelsu/Kconfig ] && [ ! -e drivers/kernelsu/Kbuild ]; then
         echo "FATAL: drivers/kernelsu is not wired into the kernel tree."
@@ -291,7 +402,13 @@ if [ $KSU_ENABLE -eq 1 ]; then
     # scope, which -Werror can also reject). Only the 4.x trees carry this file -
     # the 3.x SUSFS line does not, so the whole block is skipped there (an
     # unconditional sed would abort the script under `set -e`).
-    if [ -f KernelSU/kernel/core/init.c ]; then
+    # C-LINE NOTE: the whole block below (t20/t24/t28/t35/t40/t46/t49/t55) is the
+    # A/B-line 4.19 compat sweep for the SukiSU v4.2.0 tree. Two of its gates also fire
+    # on ReSukiSU's tree (same file names, different code), where they would rewrite
+    # working code - e.g. the t40 SELinux stubs would disable ReSukiSU's own SELinux
+    # policy injection. It is therefore gated on `WITH_SUSFS -le 1`; the C line has its
+    # own transform block further down.
+    if [ "$WITH_SUSFS" -le 1 ] && [ -f KernelSU/kernel/core/init.c ]; then
         if ! grep -q '^#ifndef MODULE_IMPORT_NS$' KernelSU/kernel/core/init.c; then
             sed -i '/^#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)$/,/^#endif$/{
                 s|^#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)$|#ifndef MODULE_IMPORT_NS\n#define MODULE_IMPORT_NS(x)|
@@ -318,7 +435,7 @@ if [ $KSU_ENABLE -eq 1 ]; then
     # the end turn a missed fix into a hard failure instead of another ~21 minute
     # build cycle. Only the 4.x trees carry these files, so the 3.x SUSFS line
     # skips the whole block (an unconditional sed would abort under `set -e`).
-    if [ -f KernelSU/kernel/feature/sucompat.c ]; then
+    if [ "$WITH_SUSFS" -le 1 ] && [ -f KernelSU/kernel/feature/sucompat.c ]; then
         KSUK=KernelSU/kernel
         # (1) linux/pgtable.h (5.11+): sucompat.c uses no pgtable symbol at all
         if grep -q '#include <linux/pgtable.h>' "$KSUK/feature/sucompat.c"; then
@@ -403,7 +520,7 @@ KSU419EOF
     # call at L150 sits under `#ifdef __aarch64__` only, and hook/arm64/patch_memory.o
     # is unconditionally in kernelsu-objs. It is therefore a real 4.19 blocker and is
     # shimmed here. The user-space strncpy shim mirrors mainline v5.8 mm/maccess.c.
-    if [ -f KernelSU/kernel/feature/sucompat.c ]; then
+    if [ "$WITH_SUSFS" -le 1 ] && [ -f KernelSU/kernel/feature/sucompat.c ]; then
         KSUK=KernelSU/kernel
         if ! grep -qs 'ksu_copy_from_user_nofault' "$KSUK/include/ksu_419_compat.h"; then
             cat > "$KSUK/include/ksu_419_compat.h" <<'KSU419HDR'
@@ -641,7 +758,7 @@ KSU419HDR
     # selinux_state.policy / status_lock / status_page, struct selinux_policy),
     # seccomp arch cache 5.9 (struct seccomp.filter_count, SECCOMP_ARCH_NATIVE_NR),
     # vdso clock spoof 5.2 (struct clocksource.vdso_clock_mode).
-    if [ -f KernelSU/kernel/selinux/selinux.c ] && [ -f KernelSU/kernel/feature/selinux_hide.c ] && [ -f KernelSU/kernel/infra/seccomp_cache.c ] && [ -f KernelSU/kernel/feature/cpu_spoof.c ] && [ -f KernelSU/kernel/policy/allowlist.c ] && [ -f KernelSU/kernel/manager/pkg_observer.c ] && [ -f KernelSU/kernel/supercall/dispatch.c ] && [ -f KernelSU/kernel/policy/app_profile.c ] && [ -f KernelSU/kernel/selinux/rules.c ] && [ -f KernelSU/kernel/selinux/sepolicy.c ]; then
+    if [ "$WITH_SUSFS" -le 1 ] && [ -f KernelSU/kernel/selinux/selinux.c ] && [ -f KernelSU/kernel/feature/selinux_hide.c ] && [ -f KernelSU/kernel/infra/seccomp_cache.c ] && [ -f KernelSU/kernel/feature/cpu_spoof.c ] && [ -f KernelSU/kernel/policy/allowlist.c ] && [ -f KernelSU/kernel/manager/pkg_observer.c ] && [ -f KernelSU/kernel/supercall/dispatch.c ] && [ -f KernelSU/kernel/policy/app_profile.c ] && [ -f KernelSU/kernel/selinux/rules.c ] && [ -f KernelSU/kernel/selinux/sepolicy.c ]; then
         KSUK=KernelSU/kernel
 
 
@@ -1020,18 +1137,22 @@ T43LIST
     fi
 
     # t46/P2-2: B-leg (3.x SUSFS tree) coverage gate - deliberately OUTSIDE the guarded
-    # block above, so it runs on both lines: it inspects this script's own text and
+    # block above, so it runs on both A/B lines: it inspects this script's own text and
     # requires every 4.x-only file it handles to sit behind a `[ -f ... ]` test.
     # run7's B leg died after ~2 minutes on feature/selinux_hide.c precisely because
     # that handling had no existence guard (a runtime check inside the guarded block
     # could never catch its own missing guard).
+    #
+    # C line: this gate asserts facts about the A/B-line t40 block, which the C line
+    # never runs (see the `WITH_SUSFS -le 1` note above), so it is A/B-only.
+    if [ "$WITH_SUSFS" -le 1 ]; then
     t46_self="${0:-build.sh}"
     # t52/F3: anchor this gate to the single t40 guard line instead of scanning the whole
     # script - a decoy comment line containing the literal "[ -f <path> ]" used to satisfy
     # the old whole-file `grep -qF`.
-    t52_guard_ln=$(grep -n '^    if \[ -f KernelSU/kernel/selinux/selinux.c \]' "$t46_self" | head -1 | cut -d: -f1)
+    t52_guard_ln=$(grep -n '^    if \[ "\$WITH_SUSFS" -le 1 \] && \[ -f KernelSU/kernel/selinux/selinux.c \]' "$t46_self" | head -1 | cut -d: -f1)
     if [ -z "${t52_guard_ln:-}" ]; then
-        echo "FATAL: [t52] the t40 existence-guard line (^    if [ -f KernelSU/kernel/selinux/selinux.c ]) is gone."
+        echo "FATAL: [t52] the t40 existence-guard line (WITH_SUSFS -le 1 && [ -f KernelSU/kernel/selinux/selinux.c ]) is gone."
         exit 1
     fi
     t52_guard=$(sed -n "${t52_guard_ln}p" "$t46_self")
@@ -1050,6 +1171,7 @@ T43LIST
         esac
     done
     echo "t46 B-leg guard coverage gate passed: the single t40 guard line carries exactly 10 existence tests (comment-proof)."
+    fi
 
     # t49: the fork's kernel tree was patched for the *3.x* KernelSU hook API and
     # guards those call sites with `#ifdef CONFIG_KSU` (both lines set CONFIG_KSU), so
@@ -1064,7 +1186,7 @@ T43LIST
     # line does its own hooking (kprobe/tracepoint + *_sucompat/_ksud), and the kernel
     # tree's `else` branches (e.g. ksu_handle_execveat_sucompat) keep working. That
     # preserves the SPEC rule "A line has zero MANUAL_HOOK" - no SPEC change needed.
-    if [ -f KernelSU/kernel/runtime/ksud_integration.c ]; then
+    if [ "$WITH_SUSFS" -le 1 ] && [ -f KernelSU/kernel/runtime/ksud_integration.c ]; then
         KI=KernelSU/kernel/runtime/ksud_integration.c
         if ! grep -q 't49: legacy 3.x hook API compat layer' "$KI"; then
             # ksu_handle_sys_read already exists here as `static void`; the kernel tree
@@ -1195,7 +1317,7 @@ T49COMPAT
     # config edit away from crashing again. The neutralisation is applied ONLY when the
     # 4.x tree is present: the 3.x SUSFS line needs those very call sites (its sucompat.c
     # defines them with the 3.x convention), so it stays untouched.
-    if [ -f KernelSU/kernel/hook/syscall_event_bridge.c ]; then
+    if [ "$WITH_SUSFS" -le 1 ] && [ -f KernelSU/kernel/hook/syscall_event_bridge.c ]; then
         t55_strip() { # $1 = file, $2 = sed address, $3 = literal probe text
             if [ -f "$1" ] && grep -qF -- "$3" "$1"; then
                 sed -i "$2" "$1"
@@ -1276,6 +1398,297 @@ T55SITES
     else
         echo "NOTE: KernelSU/kernel/hook/syscall_event_bridge.c not present (3.x SUSFS tree) - the kernel tree keeps its own legacy KSU call sites, which match that line's sucompat.c convention."
     fi
+    # ===== C-LINE-BLOCK-START =====
+
+    # ===================== C line: ReSukiSU 4.x + SUSFS 2.2.0 ==================
+    # Everything in this `if [ $KSU_ENABLE -eq 1 ]` block above is the A/B-line 4.19
+    # compat sweep for the SukiSU tree. The C line is a different KSU tree (ReSukiSU
+    # carries its own 4.19 compatibility layer) and needs a different kernel-side
+    # change: the fork's baseline ships SUSFS 1.5.7 inside fs/ + include/linux/ +
+    # kernel/, which has to be stripped before the SUSFS 2.2.0 kernel patch can
+    # apply, and the 2.x hook call sites then have to be installed with the
+    # signatures the 4.x KSU tree declares. None of that touches A or B: this block
+    # runs only for WITH_SUSFS=2, and the C line is built in its own CI job from its
+    # own checkout.
+    if [ "$WITH_SUSFS" -eq 2 ]; then
+        # [P0] line discrimination by FILE, never by a version string: the two 4.x
+        # trees are told apart by ReSukiSU-only paths (KernelSU/kernel/Kbuild exists in
+        # both, so it is not usable as the discriminator).
+        if [ ! -f KernelSU/kernel/hook/syscall_event_bridge.c ] || [ ! -f KernelSU/kernel/tools/inline_hook_check.mk ]; then
+            echo "FATAL: [cline] this is not a ReSukiSU 4.x tree (hook/syscall_event_bridge.c and"
+            echo "              tools/inline_hook_check.mk must both exist). Refusing to patch it."
+            exit 1
+        fi
+
+        # ---- the SUSFS 1.5.7 reversal patch ---------------------------------
+        # Embedded, not fetched: it is derived from this fork's own baseline and is
+        # the only artefact that can strip it byte-exactly. gzip+base64 so the 91 kB
+        # patch costs 26 kB here, and the decoded blob is verified before it is used.
+        CLINE_DIR=out/.cline
+        mkdir -p "$CLINE_DIR"
+        base64 -d <<'CLINE_PATCH_B64' | gzip -d > "$CLINE_DIR/susfs157_reverse.patch"
+H4sIAAAAAAAACu19a1vbyJLwZ/gVHc6GGLDBNrcQhux4wEm8AcwaSCZ7Zh6tbLVBB1lydIF4Lvvb36eqL+qWWrJMmDOXd/LMJKC+V1dXV1XXxXHHY9Jo3LgxsbfG0ZZvT6i7OSJD5ZflRqOhlS5vbGzoNb79ljR2mvUDsrHTrO+Rb79dJv9w/ZGXOJR847l+8mXL9d3Yiu3obvP2db40sUcjGkXGsmHieo41TG6gtPEPd0wcOnZ96tSO++dvem+t95fX1uX15ZtL+Nu66Fy9WyO//FJcq3/RPbcG3ZPeoHt8tQZd6gNGSTSOLIeO2YDUd9zxMlEmtuL6MQ1929u8XVE/T4LEj+EbwKPVbL6st9pko9Vs7nKgLI0CP4pJFIfJKCauHziUrE/tkPrx4TJZuktcx4rJNHGdw2WCa3XomBQuc7mx5I5JzXcar1lfq6sk8T33jnqz9GvjtWtFsR1Tskp65/2TrnV51bnqKsBaXSW80SgJYTKN1wwGsF+y7VXn8r11eTW4Pr6yzvvn1qDfv7KuL7sDq3NxYV0M+sdra+Tn5cbSUkjjJPRJo3ve755fHS43ln6VcGwsE5z0s2gWjWLPmoZBTEcxdaxoNvFc/y5aWyayiybAgUHzoMWh+bLNofnzMlnSQcn+OSLQT+O1Q/04nDVeOxZ+XwSkxg408Bpr/PFAvbVOejj3h9CN6dAe3RE3In4Qk8geU/JwS30S31KSuA4JQnLjOsQOKXH9e9tznU2yviX2C3ATP9bkUhPXwZP27CZfduM6a+pONrr9D93Bm9P+x0O2oa1tfjxa7W2+obB8d0RcPyYTe2aNQmrH1HJ9K4rd0d2slkwCh1oxcdzQgh/rhJ8Y+JC4Th3GW8rgBGFnDn9bA6SpigNyq/+gWwtzNByjsTsOIpjMpdW7fNN700/nDzBbgx1bJkuEENMhDOlN4tmhaD/ovi1uzlf7rCb2g7BGH66+Z9Vwn/f2dtg+7+2IfV5acqZJXGOHZw0o3xL7mRyRwAPah0uttk3PepdWdzAQvcHMy87t735i9aWn+9wdDKyLq0GN7/eavuFEVGMtD5fJr4Iy7h/sMwDv74vLdykP0KVf/4bqAlBttw+2Eart9p4CVQCidjKvTnoDDt4qCLu0tUUeKHGo7ZEHN74lURKRKBmSqR3fklsaUqj0h7zUlSu5saTB8FcFbDsvGVVv7+wcCLCxC5XRipDG97bHbgY7cdyYHcMacJJ1hIK4VOtk7Nk3EVklp/3+++sL66IzYDsIuxbFQUgt5D8dO7ZrsLFVCQabAwBIHc9MLow1/v3AnyYxrBXBpFEN4+1AsvUlnrOlI57jdh3s79ZbLbLRPthOsZzXpWEYhNAWgNa7hDl1z0+A2Gcu9ovu4OzwL3GtEr7a0S0d3Qmuw3HDOmcfgNlJISG/8fuwd2n1zs6urzrfnXbTQvh8+bFz8aanfX3XubSuz8+gqxOrJzpbw23ZbjYP6u0mbMvuQf0lbgtyYpJB8lyfZvikGmd77scRyiFkfeLH9YysgWvhn/gNsT66dT2nOmfkxwIzUnTjPSYRDfFMRlN7RMl6ZLEvEWCRctotHJIBFn+sk871Se/Kuvp00bWO3/VOT6zjQbdz1V3gWGNH5kOsF/37UQ7hRY7YJlhTGk7cKHIDn0HgrPPJ+jjoXXXJL/hz9/vuMTvjsCxsmyHBAv5IhueRgjxs9NPb/b53eaUc85Nu5+SkN+DnHNGxtdtGor7dPJBUAimpoTs+B/KXYbOjBzce3RKdDWac7puzK+iELI3siOKH0/P3rzRwnPb7F0zg2W632aHebu216vsmgScQR1lTEyBrYDy54qIUchEy6JpcXHIiFz3sfLv+0Lx12UHL3eK/1cmTs4joKAndeGbBDlqTOz/gNE/sG5Nhm0jkqBdROFYC4gu3V447m7nhKmeIuP2SqVK2t5vyOANja9heht6gRTi2R7fUIdMgcmP3HlhYqPiKPLieR4Ip9Ynrk7EVTBuv8bf1rWoMsUYCfncEyktnhj3WyOvSTRAHJEhiyw8sWDmTXjmod7ab9dYegFoRfpeQW8DDiqKDBgK++UdiQFwj14Sk+ypxTC2pdqb/lEIzu8VUKPDvhg0TO5YBDUpvj9viLEOcbu/uLj9Juy+zQmJOxZGK5CGtSH/Zuv/YO1OyAypAdYj+qkJx/+Cg3jogG9t7B3sATgRjRivCNp0L6IWg0zT7yw36BdT04tYcux6Fq3AdhO5xZN3Q2Aqp44ZM8wVEtpb4kXvjU4d4gX8D14hCWxvLak9k3QmssetN8dDXgG47Y6eeHQzU+/EtSrewbu1ih4YWE3LXg6l+cUvJlviovoH+WdUjAjTWC4K7ZMpaQ7k2M5jWYWUoLeWmPLbvKMIDflUuFxiHxorUveo7dbZsURtRHcYnR/gNoWPHrGYwFUL9L0KoHxxfr3H+6GXroN7eJRvb+02pOpjfFQ6oUVDW5EhRqF1edU67a0xqXWRu3Q+d07UFAKlSVhgHT5s2r8brcflB1d+mkPazYwr67draJiguviHtZrPJz5+2V8A0FOJ2bnyO3vqNoPWn6H5MCpclBk5r5AURxf7r5Pz6FGG2hLouPyA+pQ6JA+IE5H+FWiLFlv9FpRexI+LGjJcYUuIEPiXDGRnZnuf6N2QaBvA6iJ0WIaA+73RyC+GhoLgluITSKeASEroq6FmhU4mg1To1oGjZHgmom0DEySynGOyK1PWjhk6J3oz8uuwY3pFR5FDfkvkH/T1ZfNTelMVH1FHt1bf3yEZ7r95qGl+Wh0EQT+jE+HaMl9pDEJpfnSNgabFOtafls/41MGRlb8tXg0/WNav3mIflKZzNzKuy9thczjbgwPLeGwaBx+mBG1mCjtxFieUEE9v1a/eB6wAelNb/aXYTxDTbZLnBZdeT7pveedfqnXRqrOnEjy3XsVzHhnpltW7CIJmKisuNfzCgkuNT67h/8ck6O7+yzi/Jd72rWnt3jWytgzTrIF0IpjPswY9qa0zSEFd0IXg611d9q3NygnCCzyfdN53r06sMzGB9HAZ2EgeW7ThWlEQManRsJ15soXqNy+ijWzskFkrVZD0OtOOlw7O8O4v69tCjDjkicZgol261BX3XOz/JrAQ4BsNChq7v5FeQcim61gFpUGyHNzSes6K0369YSnp6rDf9gWlVpv2Jw5mVsKHHQaiuMLeWkkUU9lK8nmVAyjP7iztJJsRPJkMakmBMsFUE8rDNfiaKBmZrmUgmE7eIvcCykSb2F2JZIbVh6Cj2QFhoNeGPtINot+utl2TjYE+wSJwUr2IP08D1Y+vWjm5jmPM/48mUrJLJFD9ZEzu6+3EeD63Qka0t0k9CEjz4BE6b7XnByAI2hMS3dkzsCNYRYRnsSmyHMVzX4zCYEHG8sLvzK6t3IolBiplar3yzUuX12nIDuA+oHlJgfF3H5tUnrl9bzdKbumHQOnn75sJ63x2cd/Ge5Fwa9PcNaeKFK59GQChbmoBExFckJDX16Uu5HFXt3ZyFIGtvWEhtVZ2+NlXc7Z29ensPjV74dstR8SBA43FIafGoVbYZGLWPlES3QeI5ZOyGSBXo6A4tQ14IiGxq8AZTkmT6ok4iSok7BvbNjQwbgAcZhgWh0bo+v3zXGXTZmO6YREEdBomoQKIH4AbBPIUhF6P3GeSLAnxDDfwXseQuAQrEjTezSuWyyQMPVnHCurJYKPq2tsh58ACTGdk+BxmCQp4JF153o6JJQY3XpjmI4QBPYGUmXFc6UV8Elbmd2khC3PGcPRQWQU3cCx+2chT4se36EbEJh1UQujcuowOuw/pn+8AhD+QO0IXVg+dteyaNqeZuhVjw1hbpjUnppvHJ/kTDoA7jTqjNaJAEKQB9GgRj6tR5n1HAxIwHSvhR1qbK242DkAwpo2CUOpv6Dphgb1xKfjNS5Wxpb2wnFcOOHXwvaLX2+HOB/gaoUh3BSn0NFeDkiRHJrS1yLPB54sfk1kZMTvcfNnY+Hqu7CmednWpiy75w4sR1co3fDvrXF1bvhN0mBqaRQbn0WpB164XdZ+8Hrs8dzqZ2FFmAIdbYCx7EqTIOmBmqle0z29krXd3/qD4zD9byPku1lbiVKEA1m/XWLtlotYVaBfFIXiAh9agd0SfBIf38yi5N2JHugDzEQKaQGtleFDAUgTnAKd7aYrRJEBw4v/lhSnBFw9cq8yohwcrG5LpkSJQf6YgbzlQhDHP6J0XdC6uO3Z36dgsMwnbqrW3GJU78GNS0qxNsN1eRquwppzc6UjBMBVODjBzBZAjGYiM/YSEpBgOKmIySKA4mnFyuyVOw+AhrKegUnWmKsOSI3E3oxBrBo5X1E2O1YFj8kDlL7AQBVNhjF3+Cm/uGLXAem6uLVd8snulrFjpzGuIDX54JZpuD+nIC0BENdLZU6/RQ7bKpvnQUkjJdGc9amqZRYflG4iZ65o+R7MlKPpQhx4o7kVp3A6MLYs0Omo8Byt6PI+uOhr4uyoGS2opmUUwnVjybUrIOfzP0Qt1YneTREUndOmiv1goQptpas+0OlU+gjUilPKacgHJxT+M+qWYF+lN+GATgAiAMK2BRKjFXjUNPuh8AaysT5DdBSHz64M34i5jDBVTk9kjgQ4HteTQUelbG0IIVeETeX15nudcyjdKaYOTYIdQOMdsLEKH5m/Wcu7awi7HtRaKPkru1oH3utfwZu+GMsD7rnq0pLgjb9fYB2TjYl+8TkhGELY6GIDEGQQzPcdFQI9SpdM6OWtqK73xalfmDsGpMMVZtnxtw9WZ20o0I09+lrD1cr8QPwgkwvni9ckZ+ZHujxIMnCcALn36JiX1vux4oEggbgqCaXeWX41uX39IcTeboDxX8sHzge+QrpB9Nw+DLjMGAnR1BmC0/EpQTHja45o8XcD32KGF6Ey8Y3QnFt6SXnhvFFgq2Fp43ds36UeM1lEidFwcHlMH3NUFxWW+skyC0qD26Zf1Y4SipTeok053sQFBvXIek398Uc8py0hsbnKwzSs7+RlsVq39+3C0Vpupk0O2c6PXg8uFQMfRiuU6mkVJfgjbxVeBOE+NO6A8IQOmgEddvgRaKPSAgMFHtZrsebgefiB/Ftj+idbKanqTG64h1wF772DwyXTKfkp3d+s4+uly95DKTidZLM5vKZPRrCf8SckRGmin5gAKKamqtnSlTB5lDx2W6daARSAHuaTgj7mQahLHtx0yd90ClNiWJcmr4OCAuXFbueAZeQ/EtDYEokHVCkF6MPHi0Q+KC6vkYuNk18CmKXP/Goxx2cIcwIoWaHctyAssLgilgbg3UcQQm6ZoI2fvLa3a5uw4FwkPJOPC84AEE9siNEzt2A/+VmBMhrU1O7s77V8QJoFriR7dwsR29xv71y2EN1igFVJ8+6AIv77Utes31iLwfp50PUp8FRv54z3qO1lcD72UogSc2UBtnL2HhHhCA6aYgZY+beIP05F77QUyjV+Qd14eMbFCjOTQGYzmfyr1FpzC+ODdStuyn2Y0b3cHG+gGKZggYcYX4jKGY2mAzGSSx1s8IrFdcX3QRBUk44l/hLvGDB9nfMImJHROQTGPRc+o1AcCU4mFEEkCxDEywoy3OAQHl92Z1VUXHMUp5W9aNUU2HUdFSyT4YGnAcx0MgX9RrwJCS1cxJkm/qBv5EbrVD7w3sUjlDb5oXh3wBR1Y0nIJxqYEAF5D4zEuUqlV1qum8S9lAqcisk38lUjPtjrVzoelZ1YIytdTiG7Aov5rv7vG8a7avx/Ox7e39+vY23JKpa1OOJSVHxLmhcQ1+Xvt3s7IljCyxfQcVwBqCCx4WMSSkQSiuCFVf/VsyyPP54zrSNKCtSFDhtpS3FruAoddpSO/dIIkYKYGjxRXeYoAZBcIYM2vcOGB3L6NUjBeJiJOEABr1Go6goh1LI5ux7XrQWi5JdI/dBSHYDalr2RQQPGZDeTMAyK19T4lN4gmdkrH7JV2w66ujs5VP7NmQPe2E1HNRqID6Ad42Dr13R1Qc4DwN1vgZNIuaQ10fK18Y5YgioeNv+eLPLF8sIFe8RGdGcGHe5WLFr8tEquA3tEeZke1zOwKTGwf8rWirivRR+PRsc7MA7oTIdHJsPhgDYaO1ty/cw7iCF4zQ6ZepG1KuwlM9/1DpuwHT3VqHRwB8vGRTRf7q1vYdyagjgY/AMO+BAsMZkSFAR5zUTezgCg97pEgScKRBR8dUdBF5uHVHtyhPJD7cWk62G1zPwf4+BA9p7e9LswYUmzmYjFAKaVQn69M6Wf9cJ+thPQ2k0Viqcs08gUy1lHmFydGk63MwYQF/QKRZPcaApF9xk8x3du+cWfYx+IBhNDwF7h+I4BdLwGlxadagmaiFTCuhXNkRU0wwdz+m6tYhymhiNZW3L24hPKMj7EBon5Wzyd3EIitKho4b1sIsCyGcWRgUwD46dn0wsuH+xM3tNnu8etneSVHDeOSXsof+MxuM6WRWQxqlv/MG6RJqn8GGGfa5TqZ8kvwptxpEcKWF6LS6yrQ5RbeWrPC5XEuElbimKAt/qTJK+9g4yu2S+j6QKurNtE8a6rNXpeZ2vb0PHvEv01PKLabwokd/U26+dfnpHFypSGHPzF++2JCywLyt3PpyviHZWuZtG8y8GP6DcxOQaG4GM6Tk1nUc6iPDyZZJHQLmYhOg9bbnzThX1PHBboUwMzku/6pC/F2UEIYHwjylXIXOH1sXh418jKpqoSewrtxOMPAcVHHVySr8iHZ0Uh+LjzoFb0sVV1G6WQULmmutJyZY2VZQmAdqC3g0mi43DC9i/F+ytUV+J9xfBp1MG1xU1WNZQ1IHRa+4w297G6lu++VLGbqKS6ZwU4ETwhFxAsunD7yHVcbYwLuVNbVvQCAbMu8UduuwH1PvNwIcAMcqeJjDRmVPjvPsd8VL1zCIb8kpvbFHMzy5Z/aNOyJneEG9p6FPPfmipQSCWNRKlx8cfuNDkIra2aU16OJkwJuU7Rv7CbUd/OeLQe9DhzmcXlqXp50P/EeFU5BvaNUohfn45u2VIUhPavifsfMHHy4L958soc0vGgvwI5GLHsHcmZsHyJO0D/YkT6LzEzzyjP7Rpw9CAY8iIvdgaizCsvG7dYpvO1X4NBjNs8XrD1dYcX5F4eG+u35r9c9rz1DW4M5pbWBAMELGy1YaxU1MnBwZeD3yC3zsfn/RAyUX905ibtfk2RGBdyL+KzI9Sm+/YHcMX6yrvkSQ41Pr+hxQp3fafds9qQguuJq8B3sWEY/GqUKhtpaRz8mdHzxwzQda0Gj29cuN/AwV1kV/1Qbl85HSdwCxHYTmSuqIQI0vepQGGNz/yKcPiNdkaUk+qyiSIduT/e16ewfiEbT2JSfycAu+b7VpRo317Ih81j8xThPYZ1DhIESmOEmFL6kC28/FOtDG66xxodoEcK/xWno7TQLHHbupNkdRuwhTPFTWf6QYmg35C/QJoRFwJK4vuA0awTMCk7jU4RXz8yEFx8YIhuLqNIEniv5sAhMAkS0YE/rFjdCo+8XnF6pkSMO65txFPbQYoF/i0NbrcWKrHVtOuExHMv9UC5fMYk+1Jnnoc51kesq+0mr6/8/VDHRViSXlq0swQ2CjfFVOBzrKkyjO0ud1HqajIW0BwR8KVMHMqxKUvftkY3t3b7vOjcE2UQvieUsoQfoR04p4HtzPm8GDT8MlWYS/1pfJr6X625TnMHlqKEyX7Xk1FrMPggceLjeUamHiZ/kzQdM5MULvI4S8yYJn3pMs09HPVwvCiwPoKFDLK/pZbihAT/VUJlRDOajcJABFENu/Yapk+ZQFR2kISmD3nulkFzKzXRphlwisaRhM7RtULrP5pLyHxgDATK4RhUqWqyrmjDua81GFqrocYEKbrC+O8roBDIzBfadw7zmVwaoysFf6ZFWqUkvBDE0ltPlMUNkcxeFoMk13Qr7nrLy/vF7JhkjjbkIpkIW7JDz+aJDJ+U0G8MC+NXZcfxxI30n9o+I/mSlIfSgzBahE2kYVmwhDkfNNpJ/BnZ0aHSXhgrHG5vC89Avo/lhhlavzMdF22XL4vxn3yHGUfmYh6JiWogWBN5jLjEHY6p33r3pvPmFMA5Nc9abDKqwtZiXLqNlt8GAx2AsUFtAl6xMtRABZH6OPwhI2rK1D0zVTI3bZoOAkmvN1WxM7vCPr8DevtZQZwfUgsFjG2vZRMyVVZkoqzHTNbMErazK3gHX2zxEZN15zmmiBsKgGPMj3zW7CSRLTL4xQr2I3jddQaOH39IkgS7oBikRtEHH94U1KvivpAwE+YBrGehyrMX60Mu0Zl4l89DPoyazgnoagP6BObcLVo8OQ2rA+rpJ7uYeiyX6bP0ogpitTU5H8EXjMz1sVBDHgogEJjTj4VaOY0Uh0ycJAsdrpz4fmsNFc1d5sobv5SxmuR+nkSPhF0dAKxhxZCsesw4TxJybj8NjU7k1oD2tyLaPA93kMTKjaeA0f6CgOQngfYxydDMVU3R79aWK8SAVh9SBt7+HHVDOh3ODwF+N5dZdjNNZnJvoXnbdd67L3P928Ww5v5KS9oApH+lsLflxamQMGTUPXj8d68B+YyhHhMTFWAccgKAZTX6Ve0HImSgCHZ9g4PxLasyvhUuRg0AhN2HEsbF0HLzumWFmgo3QtQDbEhUgenFfPvwDmvXrufSGRQ+/hd/Dyxe83fhBSB71+XzXJCrsdCOHR0Ri2PfDYLZuGQEKuHxQXstdTh96r3crTycLMwciI1eKpF+8bLB+zx0ZYjmkEUR/WncQjqPbiB/+F2AzQTqn1cior+HiHDjXGeBeHy40cvF8VNvqV1U43QfNxeKK9Iea90TfDBH1SCfpZRhM4uq3RxIFAooLP1L+lbGbmu+QyM98xCQQ6p+/wR+lF2EiN/ywhdBf9/hvr+OzkFOJJgHq7379itQyRD9Ak0+JTtEDfHwTxKPDH7o3hosnGekqf9HkHOH+8vE23FPMyuZ/jLFc2f54YYe7UJ4J2mM+HGqhZdfThtSOoHdn31LFGwWRi+44FY+BtY+hQan+bBVg0djQEgl8zuIOfdLTBT8waDcUSoULOogXHllJc+m2kjs3NLZnPoyAaCw9Pc0A2ZAoDZrMglcPNOijNiYzmZwrVBRcgRE1Syvg9jT+vwy+P809CoZd1raq5oUNyRMCqCaEIv4N7AmexJdvxDAqYGmmXhS7dBRlShn8NqWZvyCxMqk00J4+r9zBoapna/skZmaqqFDBjqR2SudWximIGyS0e18jPRMj+mfthGkSvfoife577g49Y8uqHuPk8+MFnw0CZ+4PPL+sahqGDv9YkgIKoLhCMVcoEAhBSxmPHJXidzB2ZVSvbQX1SaQQ5JnOiaIakCBqyv9PHgAIZyEh/EBcmk0SjQunHDC1SCnSKpBTguW7huRZvPjnyc0dn5otsMrFYfG5j6QheSOcSLWSiH0G0vrGjyRb1sDzzNfaG8BV1wrstfLnb3pFBKzW6T15U8g/mk8yre+H90fUDlK05xze17id2ProiWP/cW/BUmKBOrU70KvjdEIVRSo/LRBugRHi8n1h2SG1JVe8nzBkUAbJ3UG+BjnyvzTkXjoYotWqmUplEQ+iOyqS3+4ndeH0/wYHn+c5y0GXeHBaVrcqBrXOOqwjdVRnyr6pvsEPvRTxlje9kgWv9QC10/aDaukt9hqc3wXhMjkit5gXjsRWvCcBiwRr55hsunL3rvcH7FBDVRBjSNwCVMqhfddKglWi0QSvhTAsELIV/mLNynptloZuNNAB2DbGpYlC6p+dtkOApnAzEscJ3Rbj3dL4AH4tZTGcWa+0PEK8uRwosaxp4HkZAB0NH/K2W47PqhNVC2/P1B9sVgZnyZIMf7azakbsBo9at1cyaPUTJlIYWs29dR2dgxhFo4i3zC17U/1CjE8KKspiHwSeLcjftjKCQySvFzjkEmkWaIlxOGCnkwQuMVVCtqa86DXKNoQAQhrtNBsPt9AZSNEWiA3JEfia8F5XJYjYEwGSwr/A4+ceGaYYZe+4S+C959TwhK3Uix5Y/MjZSfubc1lnnv/oDvjcOvV+rk7PeufYlZaD03RGKK8bZMARu/1UReGudm5en2etK8VmVi1d4yxWDzgScFBw3FLeJ/DW9RtJP8v5IPzF7ZmZXB7kyjffGLALLUjNnmfhuFDtmtjKYTG28TyqEFV+crcwn6awyTl4do/AqY9fzHDfc2ymNuY2N3ZiGSIPd0ETURSQNNwRlegxuWeuj+ItO24v5Ns6vsZPBHlTarTTNCQZoGnkUXAI6p72357VgPI5oHIzFXBA4MDk0HmemsmtkA97SodkGaeP5jdyfaDBGuQqP6QK5KJ9IAi7dBYC7nhElpz8aJuPGa5F44J6GoG5ky8Y18+gcbNn5sNxpa83jIf3Mjbta7GpoHxw8cg/2doy70FJ3Idnb+XsTijdhp7WPm7DTFPIv302sGNIo8TTVD3dXOfyT4jRb0AJIrbbKhF1TijgsDzgsU98m7SAJ2C0JHhyjHLtjDHVmu96mkoSVn4LXbBT05/hrbAM++zBZUnIw7KRiyRr5hvDf8TdIV4ItnmETfo9nwJrmm81e5LA2cYuzn9MrnP8u72/+OwvIiFoC+Ke5+O0NBu4Te1rh+i4PQs6UAKWuAGms8qe57HVNksKGPIGC6Ib6NHRHiC52HIcmJREn8newF2Qd/talwK115s+Y7QuCbICRLQ9NOrQjdwQOUaE7TGLKjZ2hhLEFbBjs6Vv88ornTuYRUeyIWeth2Ap2WXG9UTsXWDG3LAMfYlzY3FCLQnf09MrxRyqiKuyprosSGwhKNRuEHG4YoSZYU4rDjA4KfleKIXO1Uoq502XhjV54wwvNQRhZkzKNF6thUnuR0rXwRMjoswsR7lrCh7j7/UV/AN5yZ9/1T2sQ8g66+WKN0Rh9eSOHCMsbClcNAhF7R8dmmIRmHbNhGILTI7eMppXwO/NBXhcm+BscCNw7mB0nOR3SIG9pLM6P73Azb+UkDWcyfQw7P87YeUU6jE93aDQK3WkchCSk05BGEEbIvxFnkgLrjponG0ID2JheTPbG/Z0RdJCslFFeLU+avPbAq0kJra7myCFHImXGm/7paf9jmkIDHIuQWCLACSF5f8/ljaUsqFcRzGg+wl3jJCixCwFOnqZbeAn9X62Du33aO39vnfflXDpwONOpEEgpyv2koKx7dnH1CS9u8gvBw2f993V38Ml6c9p5CzEPnh3pXIgECUuwxPX9qaOOSJE1RRcutiL4mx3OYTIufgHQ5Lqnw0CFnMMV+ExcbpbVGRy/sz52wKn0qnO1t6PdfVrxp0vrvPvxDVTrXK0tk8tPl8ed01NwFeudd3fAt2QM04R1Mt/jgpmy5yiZtUmoR4BKp1U4pHhXzE+dmdzjkzY8KujqFUbm4S9Fg8Ly8pnAXBHnNANCKZ2NI4svtcbS46SN2D7zpuUJA/Hpd3sXlrPb+nctB5TR2+3G0AW1AeikwL5YzfLx5Ms08YfjSOUQ4TedR8QvGpeIXwBizC9OgGuhpwEz17WQjqfao4DU1ksbBwndIk2+ahGDp9Yaop8KHnrp48nOAIQu3yYb+yjLAxSgjrhPxlFxZAwVt8YRWQdSlGZPqJLmsNAWAhFznifA03FVT2ZJIAwJZFpQBA0Anyll01iQqW6cUXBuUMTRvsElpNQ6RUb/sfi3NFAKts4kPRWWBYUT0dO381tEmwOpMAd1Q+RNlU05Xcg7jVPfTXipabfJxoGSehOfPUMahzMlvEEpPoEYedr5BN4qLILiR4gThbgDTAxYKHj2jAXTFcsCV7iIQqyl+Ja8CIMXyDW9YNzNhL7QwtyxiEkRsX1iD3ncKVhJEkG8fAjIh2HPXT+aQlQmDCaYQLAXJr/wmYwD2ekD5UGeILYBy9TieRDdInbBHyjKTA3rYiinF37A5oc1eOiXTRFC8LskJg8YRCqCY4reSyKalYxfxYKVSUDwgIhgwRGBC+6MhphKAENMKfUimoYSBFBFMcptLBgX82Flzk3obZgCEqASU9uBgdLZszhUwESCByRTxsjuezzkYXzr+nfQzvZnPApVSO0IgnEFhH6ZehC3wx6yGIYuuLFjACt1mwEQwBfPMOVH8OCLMdIIOBAax6MT6gPtDEA9hBEYeehlCGYfTAQOjSMJ644/e7AxxhaLeWf70AiEUBYxMg5dek8dORPejQeJ/1DiWoOVyX5V1BAum2ECsRrB/RQiM2I8DIAbmo5yKr2GezF20t+HMxIkYUS9e4jdI0Is6o87UZye71VyeWUNTvrnp59Qa2Mo7J52rnpn4PbOxUm1xhH5P6XOYbb8lyPo4rwvS/XUdVrWVplWYxuTjG60mmlAGZWf4GtdHW/qtuEiaMwY850y0rYA6fhTwai9x53e06A7zDTVKGM85gkwAqlaRPidq29gyqxswnah7NRWxB+ns1eTHA8CU/CLyQmDqYVvnjVmeZZCI88Tntl3FKXZofpbyhPKL5InlF9YJqf6SxD+Jcoxy4mARFPPHeEPM3+0GZAESFi0GXAPhc2A/MBEEHt0txmQ1HYk4ItkH6euvxkQP4LfYUOC4b8a/5HTDK5BRCBkZzYDkLTcMf1MarLed6f94/dr9dnaMoH2M7JxBNf1mIabAYvbBYoQmBsmFm24wWZAJqDYhEGRO8iCzcE4/4KVFr+lYJNfJNjkF/YahKJUkRXe0I2taOqie6qRZw5HCbp5DT1jMZZ5YfKkD6cF/LOB5eaHrXWwzZ8dD+S7ox4LS0sEbYEnqmCyojisw41661Hf8qhf4z+rOgHNSf2vknU653evJ5deWo/oZ3AdjOhnBCA/22zm/Lm3/bKFV0EbAkoIwOtrB2FyE2AK4IR/83HKKidd/2NDVAOoHm1gCc4Y96VMJwq/p7Y96Xce9PUZZLBFESZlvCHgRp60SjYFPHwdSSxyn1OqkS+S5CNfxAyO9lgYuV3xCAcuojS2MRAJkjbMrH3voR+6KOCXR2rHVP2+h67QLQl43xAz54ozuwrSp3RUUiRO8R0tm1ZXUUpVDan4VkEQrlGICSlhFFhx6DoUv0XKRkRDpmVnVyLwNoI7lDNgWixwUvic0AgSUEZ3WuZi4ZumX7OAFJh9hc0A1wldGpdIFpswefx8ixErY7pjKDAhl8Gcx1SIrrgHu2gSCv/uKxxT4OgsE4Zi/lpE0kztnwqreBJIFLxA0HhhWf0Pp0htrOuLi+7gBc+hh/Fl0ih5oIfdJKBaESiRbTg3dPY8rJq/3orALDM8hu64N44cHa1eFeQTEzFGLhIdiPBFzJUwcEoRE9nPPFryzyakFEUGlBRFyDk199EXD/41mFgyN9rqdnxzMBI4a04thXtrBgtVDDRgX3rmhfzFIC4UWVKLJK4rrkaC+5kZBrV3dw8hsl57dxcFWRoG46gOT1XtrZ06GbfHkdqQI1rOuBFjAkPMuDQ8vSoWZPFVR1QjGOCqKV9eTv+cwHuq1D/z35Yd6lGI+IRYig+NrWZzb2dHUUyLqoAcWw693/ITz2M3YL210yQbzTo+oOVY2UngJMz5MlcEHszUMxZJ/7tCLXaubAQShKkgtH0nmJjbhBTtDUwMOKwXiorRt3sOQdms0/7bAktzL7iRgf207MuHaVJy1tVp/22vNp6A8fHm5hrRAvQpvayRaWhhNIOV9HE8Sl7983nyI/s/+pGsEOwoFzpHfmq8noJFsGWNE39kWXXyj39Y1oeO1Rm8vbSsNcPculXnRsOwZGpPMDOUBUuBVz59LaM7r/em96aPLvmk1WzvpN/POt9bJ4MP1nnnrAunX0lOz5IOgiv0v0BytfwELPsbrTQxPT77jd1xYDFB959ylB/TSpxwAuoC1lhRYsHPSi9KyjleIQ7ukCytPPv2H/9xeW31kI7+xz++fdaYDrp7Hw++e/99+F9h67b7fnZ/8rl5fP/xJ/fD+6EdX72c/fS5uTe+jcPu27tZO/5wuf/f7f+++tdtfDb+cPb2w0pm+nByLCe8R0L0TxUcG60fYQpICZRWIo4inyrHDGtIx6ALPJJxigrOC8RqeLCiRPpjqBY+8MpHo5E9pVYcoMZFVtOji9xQ35IzR1M7Bj+2D3W09wKPDpA8qH+DvB//ZH/hn/AygDdybQNmk2HgATu/0vnu+KT75u273n+9Pz0771/89+Dy6vrDx+8//Y89HDl0fHPr/uvOm/jB9HMYxcn9w5fZT81We3tnd2//5YHV2Pj2H6+OAHAYzYaNzrvnM0BdUwiCN/++ptcWU3f5Z81AAZd/b3sodLHyrS1yInPxoK4XySLvR+jToxgyPLAW4K7DKlnDWUyj2mraLQNZMK6lnzAUA7ST808hTDaIUpM8J7UU1KShV2xhR6wrfONyMZ4mcck3vOtDsrHhyh36mqnCH348XUBoDup/anPV9wVOLzT7lf3DW/MyckRe/NB8gezCeeJ5DQZwkdlDQPfXDCVBMoEsYZkxlxLvRqxdTx+f75Nn4H2ibiOOerxr2zEZzWvmDmjFkCJsnTDPO7LOzKwXGvAhdGNqHDFvZlF1XO5BIMkq7LFy8JSSFCeVUAoqyWL8pkAq5epZwWihPLk4VgdOCx5EXOcVefHceVEnU/EjOErPux9V5FUAx5EynSQLhRoGEwRKTbmLkD2s51a+0SpeRKazNbQgpk79N1/FswmdgF5Sm7468wXW0aut3IQ2e17FXWHs5JPthuGKEsVp0l3TrB5CMEnFBTwDTeLsyafHydWETiIa68Bs1lMOSFQvOpDp6QN6FeLTI0xwCrciXxwL9EmOyNU7yEvRP7k+7dZF0RQPmCR44jsnVKKI/5qW2qDikXRHfEeSIArwl/pyg8UTVU42lrq+y43IFJaNU6t1weKkdAGOT4a9e02ahafjxfOIpxeH6c1ISG/cCALpOrhHGh9lQHzkGzXM39pihr5wc9jiqnZC956GGEozTcdGv9BRgsKbfJsOo5jAY49yiIp4Mm1FW1twE4v7u3XQhqfpL+L39s7LuhLGN0pCqhY7AY3g9Zt+GVHqRIxfTu/nLEumgWRjt86Ga++8VBCWc2A5NltA1xrdgsluDWKhZLtbBZwUfZm285uS7XyDtA3fsvlQiCj2CH5ifnw/+CuVNhLYeYZ8qwqDb5ofVLQdJ1Pv7P1J90N28pDmrU5aa7lFJH4WNrmWGUipizCDwHYcXEXVFUdx6I+ms5oYIzNkXdyu+qEQXavHk0XTVafPK6mkE49eet6Y+cnE/lcgdor4yWRIQ/LccBbr2QHENKocnRQWJRIPj9hqpqpZIkW/fC2RKsNqhNSDnVKpFFsgexLOuBK5yt3TiLsO9TTcFQ0fj5MFAnZlNPk6TMwhmQquYjhpe2zQvynmn+yXato3aRWaVb4dwANvkfLtnoaRG/iL6b4KdG+RZw/NBUqAtVwh+qbfGYvgHnCNJfB6biwAQorvkOaJKA/2+UJwt1pUp1gGv7GD8R4KBysCI+5lkalsymnxtYBegIdt4y+lxeqTssAWlWNlSF1LGombG9UyMoQxv3FcNO0CO10l7RzKA2kMdkXXVkGHWlF5mlLVJ9Ghcg2l80dSnmpz+rdoTcmciat7ubWOtxazrt6qYqbAkZq5S1jvOpfvrjBLnahhvTvtXV7VSQvT1ypaDAarZOqAHa8YlPvXM3xkybFksE0tkDt7kFIC+Gec9XkEuyUVvzFu1GzKLu1MoNXMWHXd8wceZsSrk4GVAnEHBE8k83Ch4B2Snb4aZ7HFX4VEitSPlDgB8NioRcDVKYk5FNNQfIJyI7IST6bjaAVSaq+Mk4iu8LxihKUIh8I6GdKRDc+yYGkaxWDLy7wjpQ+ayCdy4/qMu2oR+8Z2QXZjnUWBTP/KumLiLLoVhC4Yvro+AdxEQ9Uyh941dX4w4zpfHMpWcPxJFAehfQOmqmDb7TDpX82vBmoWnnASDHAFlETPOWABnBA4wi4ZNEf+iBJ7OsXslUzKjANZzXe4Bxjrhty7tugds9BD7i8aki3CR+hc9EhtFiTYW0SZLhC8C13N+LjVbDbXeGLxBgA1u7IhzsmDjC7ozx1AaETbabAAS+mKcBIr+EzJ9749jlZYslyATg4t5E5OaTAFJsQGEZaN8O6sg6LlFjzHEjcKwEAatxTtowGjxJGBV89N6WbAXjzhe+O1CDvMdGcs5YFoVRfzAfcrwH5DBZyl6Wxljg/oRaIXwqoZ4OU41OH7CQhuOCTiKPIQ90u5Qy7mwc6mEhG46LAK8sJNrmrTNF4RB0Ead1tfDmvpRkiZuMBVbUhMElrNwkuY+qamV7Idt7zCPJxaV78cGfs6lB3xTB6GruClO7uCAkEIco3xNGNIb6V7nJUSDShYF4petCmHu1wj+7n6BKocllSwboHlxBxiLF5/nazHkyn7WWmI1Sx2iUA5C+/O0oAN79CWCZkYfmGxXtVnL9yojC51FX0s0rXIBwtcmAnrme4Vc13hjQI2+tAcI8lJtMljibLlGaYSW4AVYpq3ILLHNHdBD+/iOhErZz9xeKUYrR5yWaHxOneuMIVI9v4TVhg4FxQplS6UwNzMBkaW8a8ZuMt0KSK/gZI5RcNaAzQgT43ABiWQPN+ackRay0WZR5jI/gxb6geE+kFycwsq2iCcleyi7EbCVPiNp/BkEROXhAScb1K+DXXOBMKT72n3HFEAnn0bLbmaMs6seDixv2z7UoCYlloJXUFjlkVSTMeloIy+RhGpEr0GFHzJbkpP3i4Qa528eO4lL3L8Gr9wwF8nQTFynHgQaQX7xVtdn1x60Rh3sU5KQHe4BHCR7whPNFV2Qz7tRCsesZJroGpAr1KyL6i6oOI5EjcNosgdenkyp9A0jI2v5M00nDwWKkbN0yRRWF+hlqV1jsgkxSzuZ7q1SJYVWIX1rts5qZ2+U/xcUtlKiZmiHGGWd6uqdGUKBr6o5MWtBHnGTOaLCtR2EZFLHObUhu8ppC9F9lonvVhPRh8H3LHNZWYTDBTgf2gTj4K6b0ppSFiWIZDN3TEw9A9UsKagVI9vgQtlbD7LOsic6Ri3Cn6DLC8jiAgjqrhCstHcdDA16zlIJy469mEKSDdKQLkrHBFxy6UsFjHBLE5Cyh0EIeP0cEacgIXRgEXH5IEJneOx8BJN0ZJBwY4KumfFw5nqpcwGUtwrjT5ZqQ9g3q9aC+Mue0Zgoxc0aYIt6NYWaZIJtX14eVf2g2dtyzTKJ0V/O+hfX6SB21Wciu7cKThooqgspyyD/QDDDCITHgIkuqkAwmL8zEOY6si5mKyRkyTmCx+5AatJGppj3deKGjyKyqNkjQL5gqGS6ebAkkUkDEY12VUzSsIIHT4BhiBE0Mk0Tx0Lm8OlynnXuU2EUPM7CxVqWLEFQqoc988uOrJW9m47612ga6vCtrHoSQAgh44glQ28JGUqpFkKTG1vkxs6tzG7oNfVifAIIUXdgg9K1V6/GlA4F3N2UCawMQSsE0C8OllVr/86psBVWBnpIyakNdYY4lCZRAKzvCaDxpcz60tLYMczndVW1UEwcHwOOXmKplLupGSmvL2BO9ZZYUlhIYWSYJpLOHkVlqrCqBxqplKOFwJqZSyyHtlQSK9cCuSkooJsmhKZEtnUJAUtJpqKPRa9zdvl0j3WOzHt8nJjqXfeu7JSdlcZGVeDg5RjJh4luBZi2/WyHWSOEDZ4GsSScpcZrcoXz8SvfLlArIUlryLRAgKHWZ2TE5wipKEXgoZyoyZxIK9VUH3zu1V9VEnnnYvMY7Gpz0++rKdUbBRF3OH96YF3/rpMok70trak/QHzqcMnDe579wCSiytSQUv8S9958X4wBFOVTKYG34xjcZbfVInDH5pn1M4zRF0p3iu+L4DkIhW92L38ZjxG/C88bhVPKHwWKMpbKpK+dlLRSICO7cSL8wdW2FHHQUb0zyXYNMr9PJNm4cFV2ou7y6xvNN9V+pQWuavEvmxtkXfocqpEraENEf1G2OrLBbFThOcHc5nTB7W4nsbd8eBljgoNKVO+Kkx5SgYVwJboWqU5V4ay5Dpek+ssSfmpgwCjRwLj5wPnl05mBR/6tmxnyF334OWwtS8e54i5CR0mN1ZoTxw3uoP6O+X12RPcSp3sV6ln0S8xdNoqr3xPfScI53c6DQMnGUGPL8srBg5McWdNxLElz1K9VIlCSknBirsRMT2ho3A4YhMKd8vQ5lWGEGczmxoFfjmAkIoLMOGvQJ05NSPvL68rUWcVLK90xQG35zOmcs0ncl2ctBvodDXdsLwOuHKYB3jeqhTZucwKh8V+rWyGg+M+uR3OH1cbnLHFMVjiVDHE0Y1tNBsbVzG+QdWLbmTDen4qExt+OyG9KzbYUAwzjiDiz5NaX4DhBfZeAvonN7V4tPrzEaYWeiTzrySX2NlvZ2yBp9moN8CSRZShjCCV2Vsw0vH/h8EFP2hgZG7UYVQ8WDyIJ51M4xl3In1yKw/tAqhi5lFk57GI8vDPa+yhYPFvau3xm6vXMR04dUr060qNnIJdb23UsOeaV1Kx6x2bdOyF/T6Zkn0BQxtV8amcg0LNZ5ERjcpXZfra/ApTmgWNaTRaUMmaBtD0tHd+/b31oTu47PXPreP+SRcCUrNjIT7X9uqkBe5r1QxwwLEKuVDb82bC/7WqqUudCBRRqypok/sG2ZXv4Kv6EbYOa2pVMSCwFd9bER1hqaMUTsoKR2WFslu/tF+/tGNj6dC7kytRF8JC1KULLLUPUhDDaCCEmKFtmmYolEGcwjJ5bZgHULY134Wyv3Oa424XdwDQmtODigTFHU0q1VLRouqwfrVxy6tpaDNnZI5ExZ0xbGKsaIGl2t9n+nc/0xnzxL9P9d+nuvKpVvi0P9f9/fft/fc5//uc/5Vu7/8vT/Tfd/ffHPljOfLUiftrfDOy6oo/q+I499r0J/TN+z21tnMVWHO6T1MusF1AYIiA/vD0quAoK8KgyU+qqV0y62oramsXnXmxljADKolmme/CNla9kRH46K6R6igR6/BiwaxW+IMwNlN9wfxi+c+gBVA1N6UfMpa4C+hRywYtagE7mNPcyHBtS0Xg0moLgHmOgBj8tDjICjUnjEgXfTLDrbQzAQ31m4prOajwXBSV4cLrS8hIXHocMpXolGCcDGy0jwtCRybdMHxVIfS4V6evVJSXUQn+WpUperXAbc0iyeOF8rRZ0cuv7cUcLTWgPcbTUngcKFm1CzTA3MheSa5doEdWK6LMUVAVy9TK/CgWnVK1KsoSm0zQKGiiSjHGpn6Ftn6m8WT+uKqAZGxaMq4mBKmNR/PHVWUvY9OScTXxSm0sz38xcdCrIwddWB9LVVcM9ayWHbXoNniwJvbUup/YpmOGcUXIOhx3DPWoV8HvpS7Ov+PRE5Oed/LEIuYdPCNgq1nEcds2tIhTTNnLTOKuBp+s6xKH6bScBUw5zNrMKKHRshuTFlUVftIWj/MhzLWv4ESoAOqP4UW4iENbZnvmu7VVd8zKu7XNN3dTwv6OQorvKq5P8vNEO7cSfkaFyaP8vDKI8Edy9Pp3OWoZTu583qmCPxeYR0JkzlfkuVPuymXa9AV9ucRgRjWMctcoVIgFXeQdQ+zFR1Aatk08WRcLOCZJBAkphMIEy9nQoWHBeeWV5JGtcli1UyhWDreN0pBbSosjmQ1OWep+iZaAGONcgQ47YkzDXX0SV53jd18zhzPZS+Fk8jSH01M2DlBUpDkyIjygo5wwKOPRFyVKphCpgoWplRJY+STTGWVIo4aOGt8z19RdAd+b/kBzaDK5JSn4CZil+BLmvAZ/v6vU6AFVJ+sOTk7WK4LNuw54+rztHcvsxSJnDuYG4w6wvC9hxjo/jKrCCeGxgg5yLnrzzZXz7z3oxQj5CP0bBv68xyC4R0l7diCOEAkWYhoaxxCXpdkzK12pyUnsovO2i2kKfiO/MIhlyEHPkiQjHFPPkTqRM0hHxRaGIVlPWXvyYv+s0iOVRxtuWhzFYQ1HqhOl3PrYH7w/6Q0EG2NGL2Exq8P9STix6utgiirD/FZXib6+coaN084S/zf1+cPMKFYaqDJniELVK/LcS+oLMYmSYPPpFJ5lg0rJuOo/ECf5pOhvwBqZxj6Ne1fGebEzuiECwZtO0JxQeOmK8AYLcLjcY9si0ykfcAEYZSaVpiRVkSHH9OR5nr8A/54exK/i5PnJnLeNZQe2lNv/TfwNS5iw+b2oqhLmdAiqGyvBi7nU7fCi339jXQPiFse0x260yPZ6niFJkNh4kxn7wRjGThSyZCsY9x5pAc94tCrKURbgdE98Qxk1G4EQmGFMVWOcTFXtDpv545Qsxr4W17psLvLqnNmSlNqruhSRnomscJ9bGZtZUDoB2bRqEkcIzbXGa/nNss67H63rq0sgdDmzo+K+9EkYejFNmudyqDJpWVWZtPy24KRlO30S5kkbaJ1pQzI+0eqzHeFgEZSPD8h+TWlYHqbZCc/TPiiEQCAqUDYOsXWwPkjDAUtOKzvuP5s/gpwNSRPBNweXiZkRRnfUKQLB2prOuQuYx5Opglz5JeZhrrWUe5Pfu1zLaupplQYy6kljyPpQSjnVjBgqvFnTGoqLMmvEz/OvXWNCDdDH40+VbtjirBXMrVbPp8G7Jl5wc4N2CQF6cFNvJXdasi0dNyptWhHwKgiVW2s0cTzXpxboFoIgHgX+2C3fC7aDx2cnp+AxD7dnv3/FaumZctfH9h0tGEDqBPTLxVgZnen1u6W4Z36+IN8rhSctQfXmtQAl307zYA/TxzE2vUduEhphHvPSlejhWt503nfN0DFL6RWnV9H4RmQg6573z7pnGWFnzqEQeRALp4JsQqVVckIJD475wCxlA8zZ3YrDczmkgocrAB/mKSxAFvDZa9XRY0+7eErwBNhqGteV3MLMaRl5cFSJc4GrBBVUV9MnGHexYYWWIBsIS58H8lzi/i3uU2As74yd1Sy3WUygJBvI02yR9Ul6sZYA4xmjO4LHoZ8hJkBUm4A+unD5h6ZVK2yjpiraWsdAGlZIHTeE2MBlpLR/0T23Bt2T3qB7XBKLRKtWLR6JNgduephlnfU6WRtSQ7CSNNJZQdgSpXRu2JKy8Pum8EEiJt5XxDKZE55dNxhSg2nwsdWYGumMzNE1tBB++ZgaosesKlS1nczFKVLAmyPoaq9a9ItsgTGehoZhOdJZ1LceLohXyEcNUncub5OlWxFoOFmOsVWlTf04FhlTlx+Gv2YkjsXNq42U6GtMrP/SMTEMOPVXz4Ji6FYAgDrZro0liyVZMd1zKTCLz4r6eoevx3FADMhd6dp44mATxjP2b0/fUieG3ZGq42L/qwIgPjJtilZmmNAT5X9ZYKlSG/7vXuhj88co6emZEoo1gsEz41RNJWO8KufbWhrx+ivsLdWdHojrHYxAxMMGNy4T74EcMDc0RtUZ06HU5oBc3gy8dXcwsC6uBjUQsLss9nUl7UuG05exCqNkbqDCy2uZh1bPBRQl1kMQ3rn+DT6WHObT1bK6TPXEm8jst+a6XNmUrayyabAbhuGV5wUOq7KZGlIbRYl+gVpRUonFAxgKrg569Owo1oYDJUTJVL7mAcKKkiePjcZewLixFUMA62MP8jD1++8vlQNiWGhxA216PEeuwEBsq7zG86zw+a4KjDILZvNMzuakdwmC7IlpLlNURJOJfQc5dEIWaLhggs8hIXgYxer0ZN/a5Nrp5IoOQibaYa+2MoL09HfTMBhSchsE4OgThHA4MOUQPxrOM7l/als/8BtKUzFz1CaWNFMW+GoO3DUNRGqnZ0KXDLznIUvZ9iyEKua9UBClkNCkqtBHYvXc7cttg5SvxfQCFvI2pQZxwGiBQgRMtrxreaCprdcIowbZY19lI3HB/Q/dwWnnkynotbIpzzF1rkOnIR0BM5ZDJdGNifQY1VnzvAzgYhIXGTyD+C7TdikPNJl3Z8mpsAIT/1Lp3aigI9OzoOkhXNNnZk7jOMKsZr4bu7bn/kSdZ+lz4QoXTrgOmKwQvqdIvLfWyXkAe5F4lNAvLip3IJI65BqjowSonBvLjMxgF4zxYIkX2A6+8DCWRHQBoNzaQmBaDLicin0RMF1uLDvueEwaDciDYG+5/shLHLrluX7yZQtrb96Sofn7skM9Ckw76sgQhVrN5t7OznKj0SjqbHljY4NsOfR+y088b/nbb0mjVW+93CMbzXqTfPst7p8PG6jY4KRZ1LWPUJeNQb5hg3BAb96+zpdBCN7IWMJfV41lwIrGAFtjKUYMNxVwEkXHWJrNAi+3/761ubu5v1L4avBN9tFgt97ER4NMf51Br3N+RVbO++eNt+97KwXJ6WU9USfVOYs/gDLr5KxzPOgz/FFLRG+CA0aNDrMNxX+A7oAykvynwub2zj90TtfIK9GKNVDWME3yvfUure5gwH/7T9bpK1FT9qBOj8/88mpwfXyVmTovk4mL5zHMLFdkYd5jIES6pGP4oytL8Dmz7E9GmvunWYnxI5AK5DjnZOf8fado0G5m/nA9J6xFe/l4RGrOokRuMrHG1y2lCIppbqDSPVHs3hW5A+FyC5kaC/4Ie8fi5el/uPhihOeC0eyLgoiIV3HTHy1+UQWoAcoBcwCcOsjl9jiGu0xmgEGXGBLc09CzZ9T5bXcy4zc5rxp3w5TVMjDJ+TRjN4YjmHVoLjqlRV7M8+pPFqyf9RquPB9/0QlVbZDzRZ63NYpbsV41rZ/zWC4+uqoncCV6yv/k1OQFB0r/k3lWKiadcyjoo7x1C/1Yn4iIFtENYaZbuA9Z36GnoKHK8qrR0McZ55osVrPgFPZ6miXcRgthptbjfK2pXm66X2E8UPbs+TtzFHP7MuhfF2aiTHrpv9a6v44zq6hrzilXs6yDcuRNMoj+h/Hub/qDj53BCTnpHp92Bp0rEJ8yTL6h1YIcfz6HB75qFPHaBuWybo9oTBWTfyNRwPAYFvgp0jAf/hGSVR5+VTK/3z2V3+GfJGHVU2SqOXyy0IWHTx1U6fC3Dh2jH9dH8FtPE/bksHLYgsPf16n88PdxrHos5/Y1zkqHCztzZGj/E3syZHr/Lez1v8L8HmpYqYnso+129VU+mv99SjvCw680m8izBBV5r4qv7IePezvPTWvuqw1zrmVt5j01MH25+bmBlT3iyYE3ND077LXLXh1Oum/MLw+8IK/0H7oxe2BQ2FLGh3bPr890dpXzp7d2SB3y4Ma36et+akxBYjjMqub9+OxEEEzOQwDnSppfdnd3d5tl9Vh2T6y4V1qRxZPAivvGitcXJ3rsCVa3NbdTNBXuHXdOTz/xNu2iNikhZzVfGmdy2b1iVJtVOjBWSuklq2UXdmWkcKzRsBBkGhFhlUfGyoPrc/ViO74eDLrnV5jv/PySNXTMU3vX/yifjLAebRXWY6s9sd50O1fXgy7vmLaLO+ZvQqzedmE98RDcH7zvnb+1zuB5irXZMbXpCZJkDbqdE77fY/P6sB5pftlrNpvN/GtZVo4l7d09YALgH/4WajtOSKOITGx/hqxHal+Q+B6UzAJugxGgW2cwwVzUtn8DL61TGroT6se2R6I4GY/roJj24TaGdiEJHnzi0MiFs8q8YLJznONOhI5h6srycZhIE7KsJRANajjLM3UsfZqxOUQTIK0KrbVJq9YWRNkXw4M/6zw1DNCmkjOsIG11JCHeIAk6v7J6J2S3yf+oU8Z5soyprj5Avgc8P0CPLwb9Y+v6/PJdZ9Al7aap3/txxLvm7/g4gDW0R3fJtHSct4P+9YUy34LZ3oRBMhVzBqK+3CDraRZa5ixx9JpEcQBOUxjGh7xQXSdeYIu0y03TTJUegtC9cX3bQ+2p64BDlh+EE/gAfUTwdDJKojiYACIotfA3rIIjxnZ0Z7FLX0AHTWeQN+OtlGGhjNzbnuugq5Pot4bpc4dUxY8gJPTLyEsi954lkQbbpps7lwS+N1srGpx/MsLrqnP53mJvuwxeGjpnQyLhnfhd76rWxiyNBbXY9YLVdkuqsTsOq+0VVNPvAKy6j8/T8rwq0z/vn1uDfv/Kur7sDqzOxQWicTrdtJUhcEo2K/wWsHaOG64oeNy56lidk+/Uy+Z/Pr3tw3I+XV51z3C87uWlmpSeizWpRPfT7CYAmZ6lip+GARgwm0Y57xepZPL9+0GRqqhKzzltyfwBcjqceeMUSp/lYxWKwysp+8vlViOXWcIZYzcGrph/NzK+ogyY3qJ2wALvt+utHbKx367vAxNMljrnJ4N+78R63/muZw26l93Bh24NHCcKitrFRdslaoflht7m+rJb26mTZG+HGGhf6rNaMNSOKpeoqV2z465B+KtnotTUF1jiFUwjHYMsoaizDghxuEx+JZYV2r4TTNyfqOXZM7QIJKXizuiWOiZRh303SzO8zLSpogzlmt32dr21Szbwh5clGwtbVALSgqJdvrHFUDZt7566vSmln7u3ezn1Ucm4RFg9zZmdaSbq9nJJeJLE9MvS0tIY/kWrOQs/HcJArCqH+E6r3moBxLd3+FEqXdQ+QFdB2Kpn5KUKxOxdPReUL5VjQpYzOrSLzvF7iMI3uD6/6p11rd75m/5yqqof3dk31AohWibaQI4DMr27OeTL392pt9qw/J3t+h5DOLJOzukDGbvUc5gZrXLjC7ZdJrO3h8E9Jbc0hOeBgMS3dsz6iG/pDPl2ju8Y4A2sRuSBcwgE5XQDHzgcZYxN7GDraQmCCV2edIDspqpYmS6ZL9Fi0LWo78CGLkH254vrRjSlI3eM8Z6AlwKw3LoRwuYVQESjS8xidOvO9rxoNok2R2SY/8bpUf47o0X57wwtXtbbe4AVLwVScBthUdEKqWfH7j21hmDa2iAt0kgLg/E4onH0T9f58iNQ2WViBPXxm551fNo5f4ugzhReveudn1711yRffnr64YzY0yn1nYjYBKw7wRWLO8GPE3+EqAQKu4g8gBB4dev6p1d9YvsOOX7TA2TEnoZBfCv0rHXycOuObsnITiIaEdBUJvBej42mQUx9sAX2ZgT9RSNU9RDU9TBeOAi8CBH/gRJkpyHAwhTxfBpE8dj9whxA6Jep7cMhiGaTYeCxaW5ydlg68oPSlD+6jTxq+8nUYvUt1ESzkmhtuSGtEdZZoI00XrEMvBGObsNaVCcv/uOF9A8MKTReWuKtIMqQaKWHYuDUeNGJkZ8J7wknRNToCCCEnQYBSEQAHSH3I30BJGf9bZIBdhCRJhjGQ/DecZD4ziYAKvOsI/HNw275VJSHS3zbWyY/M6Q+aNYPyEZrv8lxepnwlE3MMRkqD5NxHbdmDexhm2tQJYf60Wxi8dnXXO4YzPwGDJDhvSKGlw3UqDAQWfo1PYnMUNwywoC/aZJfceHtg1Z9j2y0917Wt1FjSpb4Y/6zZ5Y1nI7FILyPGvxa5/vBcvKwA81mDKvhh3pDv4jkeV7e2Fpf3sie2c3R2IUTazqq2R4U35k69vTYU6qdUNbT4qd0A5BvQz8MyEeWHtKNn5c30kN6uLyRhRcnccsbQP7fuB4YUgZJjKSN8kRDGfIW4UyKDvlGesg3Mod8g59DU9tNrS1eexxVQxrVyQps3Mqaoc9foVsgFIvChvz8azojoAzLhEjqYPuCOODXBqA6CxqI0WwAhdCo3B0TN34B/hq4kewq20SU39vdq7deko293X3BRrOAL6Hrx2MI+bLyfPqFPB+R59EP8T+fRz+ix8y97SW0joceTH1mU/BLjWnYeM0d1/FnfvLEIeNuPOk7RD4Qae+kq773fDr7rn8KXGLxnJTZAGUAEzccOzsnNSiQdPfiUYLVma+AOL2yBiHlYG99DAKoljMeZqVO9koq3UWJs1InOzImg+rNhMSp0orIvBUpsWIlvWtymmNigaKZxv3grzrjwz5pPA/7hDdDe6eJ6MJ+aGscTwgxVyQLM/8NWnWtfcxbMrn8dAnvLKBe6J13WxBbgMfpzDeWxix1dpnAXSdlILVePJmCXEuWnOABXj9tp7aaxPDwC2+wRKaviCGStQzyqGbdY4Ggqjlo5ZYN/aprXEqmhknkfO/Ystmk1JngvSyjnaFa6XD5/wGGDH7OYWUBAA==
+CLINE_PATCH_B64
+        cline_rev_blob=$(git hash-object "$CLINE_DIR/susfs157_reverse.patch")
+        if [ "$cline_rev_blob" != "5e58d3bdcd0d3c98a27a0b831484804c89454619" ]; then
+            echo "FATAL: [cline] the embedded 1.5.7 reversal patch decoded to the wrong blob"
+            echo "              (got [$cline_rev_blob], expected [5e58d3bdcd0d3c98a27a0b831484804c89454619])."
+            exit 1
+        fi
+        if [ "$(head -c 5 "$CLINE_DIR/susfs157_reverse.patch")" != "diff " ]; then
+            echo "FATAL: [cline] the embedded 1.5.7 reversal patch did not decode into a diff."
+            exit 1
+        fi
+
+        # ---- the SUSFS 2.2.0 kernel-side patch (downloaded, pinned, blob-checked)
+        # 134 kB of third-party patch does not belong in this script; the URL is an
+        # immutable commit and the blob id is asserted, so a silently rewritten
+        # upstream file can never be compiled in.
+        curl -LSs "$SUSFS_220_URL" -o "$CLINE_DIR/susfs_patch_to_4.19.patch"
+        cline_blob=$(git hash-object "$CLINE_DIR/susfs_patch_to_4.19.patch")
+        if [ "$cline_blob" != "$SUSFS_220_BLOB" ]; then
+            echo "FATAL: [cline] SUSFS 2.2.0 patch blob mismatch: got [$cline_blob], expected [$SUSFS_220_BLOB]."
+            exit 1
+        fi
+        echo "[cline] SUSFS 2.2.0 patch verified (blob $cline_blob)."
+
+        # ---- transform the kernel tree, then run every gate ------------------
+        # The transform is a heredoc script rather than a repository file: the
+        # delivery stays two files (build.sh + workflows/build.yml), so a missing
+        # companion file cannot make the C line silently skip its kernel work. The
+        # same script is exercised standalone against a real tree by
+        # enuma_kernel_build/_recon3/run_cline_transform.sh.
+        cat > "$CLINE_DIR/cline-transform.sh" <<'CLINE_TRANSFORM_EOF'
+#!/usr/bin/env bash
+# cline-transform.sh - the C-line (ReSukiSU 4.x + SUSFS 2.2.0 on 4.19.325) kernel-tree
+# transformation, extracted verbatim from build.sh so it can be exercised on a real
+# tree without running the whole build. Must be run from the KERNEL TREE ROOT with
+# KernelSU/ already in place.
+#
+# Environment (set by build.sh):
+#   CLINE_REV_PATCH   absolute native path of the 1.5.7 reversal patch
+#   CLINE_SUSFS_PATCH absolute native path of the SUSFS 2.2.0 4.19 patch
+set -u
+rc_all=0
+fail() { echo "FATAL: [cline] $*"; exit 1; }
+
+# --- 1) strip the in-tree SUSFS 1.5.7 -----------------------------------------
+# The fork's baseline already carries SUSFS 1.5.7 (fs/susfs.c, fs/sus_su.c,
+# include/linux/susfs.h + hooks in 22 files), and SUSFS 2.2.0 replaces exactly those
+# files. Without the strip the 2.2.0 patch cannot apply (19 files / 42 errors -
+# measured), so the order strip-then-patch is mandatory, not stylistic.
+if [ -e fs/susfs.c ] && grep -q '#define SUSFS_VERSION "v1.5.7"' include/linux/susfs.h 2>/dev/null; then
+    echo "[cline] 1.5.7 present -> stripping"
+    git apply --ignore-whitespace --whitespace=nowarn "$CLINE_REV_PATCH" \
+        || fail "the SUSFS 1.5.7 reversal patch did not apply (tree is not the expected 1.5.7 baseline)"
+else
+    echo "[cline] 1.5.7 not present -> assuming an already-stripped tree (idempotent re-run)"
+    cline_stripped_already=1
+fi
+# gates: the strip must be complete (deletions included), and "half stripped" must fail
+# loudly. These checks only make sense when this run actually performed the strip:
+# step 2 legitimately recreates fs/susfs.c, include/linux/susfs.h and susfs_def.h, and
+# CONFIG_KSU_SUSFS is of course present inside the 2.x code afterwards.
+if [ "${cline_stripped_already:-0}" = 0 ]; then
+    for cline_f in fs/susfs.c fs/sus_su.c include/linux/susfs.h include/linux/susfs_def.h; do
+        [ -e "$cline_f" ] && fail "$cline_f survived the strip"
+    done
+    cline_left=$(grep -rl 'CONFIG_KSU_SUSFS' fs include kernel mm security drivers 2>/dev/null | wc -l)
+    [ "$cline_left" = 0 ] || fail "CONFIG_KSU_SUSFS still present in $cline_left file(s)"
+    cline_left=$(grep -rl 'susfs_' fs include kernel mm security drivers 2>/dev/null | wc -l)
+    [ "$cline_left" = 0 ] || {
+        grep -rl 'susfs_' fs include kernel mm security drivers 2>/dev/null | sed 's/^/   residue: /'
+        fail "susfs_ residue after the 1.5.7 strip ($cline_left file(s))"
+    }
+fi
+
+# CLINE_STOP_AFTER_STRIP=1 is a test hook: it leaves the tree in the "stripped but not
+# yet 2.2.0" state so the residue gate above can be exercised end to end on a real tree.
+if [ "${CLINE_STOP_AFTER_STRIP:-0}" = "1" ]; then
+    echo "[cline] stopping after the strip (CLINE_STOP_AFTER_STRIP=1)"
+    exit 0
+fi
+
+# --- 2) apply SUSFS 2.2.0 (kernel side) ---------------------------------------
+# The 2.x kernel-side and KSU-side halves are split: this patch is the kernel half
+# ONLY (19 files, no ksu_handle_* call sites), which is why step 3 exists.
+if grep -q '#define SUSFS_VERSION "v2.2.0"' include/linux/susfs.h 2>/dev/null; then
+    echo "[cline] SUSFS 2.2.0 already applied"
+else
+    git apply --ignore-whitespace --whitespace=nowarn "$CLINE_SUSFS_PATCH" \
+        || fail "the SUSFS 2.2.0 kernel patch did not apply"
+fi
+grep -q '#define SUSFS_VERSION "v2.2.0"' include/linux/susfs.h || fail "include/linux/susfs.h has no SUSFS v2.2.0 marker"
+grep -q 'CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile || fail "fs/Makefile is not wired to susfs.o"
+[ -e include/linux/susfs_def.h ] || fail "include/linux/susfs_def.h missing after the 2.2.0 patch"
+
+# --- 3) inline-hook call sites for ReSukiSU's 4.x conventions -----------------
+# KernelSU 4.x drives these hooks from its own inline-hooked call sites and has no
+# `ksu_*_hook` enable flags any more. ReSukiSU enforces this with
+# tools/inline_hook_check.mk: it $(error)s when an old flag is still present in
+# fs/read_write.c, drivers/input/input.c, fs/exec.c or fs/stat.c, and when one of the
+# required ksu_handle_* call sites is missing. Five files need work here; fs/open.c,
+# fs/read_write.c's and fs/stat.c's new call sites already come from the 2.2.0 patch.
+CLINE_MARK='cline: 4.x inline hook'
+
+# 3a) fs/exec.c - the 5-arg ksu_handle_execveat_sucompat() call is the site that
+# oopsed on the device (regs=NULL -> NULL+0x10). ReSukiSU reaches execveat through
+# kernel/hook/syscall_event_bridge.c (3-arg convention), so the kernel tree must not
+# keep a second call site with the 3.x convention.
+if ! grep -q 'cline: 4.x inline hook (exec)' fs/exec.c; then
+    sed -i '/^[[:space:]]*if (unlikely(ksu_execveat_hook))$/d' fs/exec.c
+    sed -i '/^[[:space:]]*if (!ksu_execveat_hook)$/d' fs/exec.c
+    sed -i '/^[[:space:]]*ksu_handle_execveat_sucompat((int \*)AT_FDCWD, &filename, NULL, NULL, NULL);/d' fs/exec.c
+    sed -i '/^extern bool ksu_execveat_hook __read_mostly;$/d' fs/exec.c
+    sed -i '/^extern int ksu_handle_execveat_sucompat(int \*fd, struct filename \*\*filename_ptr,$/d' fs/exec.c
+    sed -i '/^[[:space:]]*void \*argv, void \*envp, int \*flags);$/d' fs/exec.c
+    sed -i '0,/^#ifdef CONFIG_KSU$/s|^#ifdef CONFIG_KSU$|/* cline: 4.x inline hook (exec): the 3.x flag branch is gone; ReSukiSU reaches\n * execveat through kernel/hook/syscall_event_bridge.c with its own convention. */\n#ifdef CONFIG_KSU|' fs/exec.c
+fi
+if ! grep -q 'cline: 4.x inline hook (exec)' fs/exec.c; then
+    fail "fs/exec.c: the 4.x execveat conversion marker was not written"
+fi
+if grep -q 'ksu_execveat_hook' fs/exec.c; then
+    echo "   fs/exec.c still mentions ksu_execveat_hook:"
+    grep -n 'ksu_execveat_hook' fs/exec.c | sed 's/^/      /'
+    fail "fs/exec.c still branches on ksu_execveat_hook (KernelSU 4.x has no such flag)"
+fi
+if grep -q 'ksu_handle_execveat_sucompat' fs/exec.c; then
+    fail "fs/exec.c still mentions ksu_handle_execveat_sucompat (the 3.x convention that oopsed on the device)"
+fi
+
+# 3b) fs/read_write.c - drop the 3.x flag guard; the 2.2.0 patch already installed the
+# 3-arg ksu_handle_sys_read(fd, &buf, &count) call the KSU tree declares.
+if ! grep -q 'cline: 4.x inline hook (read)' fs/read_write.c; then
+    sed -i '/^[[:space:]]*if (unlikely(ksu_vfs_read_hook))$/d' fs/read_write.c
+    sed -i '/^extern bool ksu_vfs_read_hook __read_mostly;$/d' fs/read_write.c
+    sed -i '0,/^#ifdef CONFIG_KSU$/s|^#ifdef CONFIG_KSU$|/* cline: 4.x inline hook (read): the 3.x enable flag is gone (inline_hook_check.mk\n * rejects it); the call site comes from the SUSFS 2.2.0 patch. */\n#ifdef CONFIG_KSU|' fs/read_write.c
+fi
+if grep -q 'ksu_vfs_read_hook' fs/read_write.c; then
+    fail "fs/read_write.c still uses ksu_vfs_read_hook (incompatible per inline_hook_check.mk)"
+fi
+
+# 3c) drivers/input/input.c - same pattern for the input enable flag.
+if ! grep -q 'cline: 4.x inline hook (input)' drivers/input/input.c; then
+    sed -i '/^[[:space:]]*if (unlikely(ksu_input_hook))$/d' drivers/input/input.c
+    sed -i '/^extern bool ksu_input_hook __read_mostly;$/d' drivers/input/input.c
+    sed -i '0,/^#ifdef CONFIG_KSU$/s|^#ifdef CONFIG_KSU$|/* cline: 4.x inline hook (input): the 3.x enable flag is gone (inline_hook_check.mk\n * rejects it). */\n#ifdef CONFIG_KSU|' drivers/input/input.c
+fi
+if grep -q 'ksu_input_hook' drivers/input/input.c; then
+    fail "drivers/input/input.c still uses ksu_input_hook (incompatible per inline_hook_check.mk)"
+fi
+
+# 3d) kernel/sys.c - ksu_handle_setresuid() must be reachable from __sys_setresuid()
+# (ReSukiSU declares it in hook/setuid_hook.c:152 with this exact signature).
+if ! grep -q 'ksu_handle_setresuid' kernel/sys.c; then
+    sed -i '/^long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)$/,/^}$/ s|^\([[:space:]]*\)kuid_t kruid, keuid, ksuid;|\1kuid_t kruid, keuid, ksuid;\n\1/* cline: 4.x inline hook (setresuid) */\n\1extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n\n\1ksu_handle_setresuid(ruid, euid, suid);|' kernel/sys.c
+fi
+
+# 3e) kernel/reboot.c - ksu_handle_sys_reboot() must run BEFORE the LINUX_REBOOT_MAGIC
+# check: ksud's reboot(2) ABI uses its own magic values and returns 0 to consume the
+# call. It must stay after the CAP_SYS_BOOT check so an unprivileged caller cannot
+# reach it.
+if ! grep -q 'ksu_handle_sys_reboot' kernel/reboot.c; then
+    sed -i '0,/^SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,$/s|^SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,$|/* cline: 4.x inline hook (reboot) */\nextern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n\nSYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,|' kernel/reboot.c
+    awk '
+        { print }
+        /if \(!ns_capable\(pid_ns->user_ns, CAP_SYS_BOOT\)\)/ && !done {
+            getline nxt
+            print nxt
+            if (nxt ~ /^[[:space:]]*return -EPERM;/) {
+                print ""
+                print "\t/* cline: 4.x inline hook (reboot): before the magic check on purpose -"
+                print "\t * ksud uses its own magic values; a 0 return consumes the call. */"
+                print "\tif (!ksu_handle_sys_reboot(magic1, magic2, cmd, &arg))"
+                print "\t\treturn 0;"
+                done = 1
+            }
+        }' kernel/reboot.c > kernel/reboot.c.cline && mv kernel/reboot.c.cline kernel/reboot.c
+fi
+grep -q 'ksu_handle_sys_reboot' kernel/reboot.c || fail "kernel/reboot.c has no ksu_handle_sys_reboot call site"
+
+# --- 4) KSU-side 4.19 compat --------------------------------------------------
+# 4a) copy_to_user_nofault()/copy_from_user_nofault() are 5.8+; this tree spells them
+#     probe_user_write()/probe_user_read() with the same contract. ReSukiSU's compat
+#     layer covers strncpy_from_user_nofault and copy_from_kernel_nofault but not
+#     these two, and both call sites in runtime/ksud_integration.c are unguarded.
+KCC=KernelSU/kernel/compat/kernel_compat.c
+if [ -f "$KCC" ] && ! grep -q 'ksu_419: copy_to_user_nofault' "$KCC"; then
+    cat >> "$KCC" <<'KSU419'
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+/* ksu_419: copy_{to,from}_user_nofault are 5.8+ (mm/maccess.c). This 4.19 tree
+ * spells them probe_user_write()/probe_user_read() with the same contract: 0 on
+ * success, -EFAULT on fault. ReSukiSU's compat layer provides the strncpy and
+ * copy_from_kernel variants but not these two, while runtime/ksud_integration.c
+ * calls both without a version guard. */
+__weak long copy_to_user_nofault(void __user *dst, const void *src, size_t size)
+{
+	return probe_user_write(dst, src, size);
+}
+
+__weak long copy_from_user_nofault(void *dst, const void __user *src, size_t size)
+{
+	return probe_user_read(dst, src, size);
+}
+#endif /* ksu_419: copy_to_user_nofault */
+KSU419
+fi
+if [ -f "$KCC" ]; then
+    grep -q 'ksu_419: copy_to_user_nofault' "$KCC" || fail "the 5.8+ maccess shims were not inserted into compat/kernel_compat.c"
+fi
+
+# 4b) infra/file_wrapper.c guards its remap_file_range use with
+#     `#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)`, which is TRUE on
+#     4.19.325 (267333 > 267264 - the 325 overflows into the minor field) while the
+#     member only exists from 4.20 on. Move both guards to the 5.0 boundary, the same
+#     convention the A line's t28b fix uses.
+FW=KernelSU/kernel/infra/file_wrapper.c
+if [ -f "$FW" ] && ! grep -q 'ksu_419: remap_file_range is 5.0+' "$FW"; then
+    sed -i 's|^#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)$|#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) /* ksu_419: remap_file_range is 5.0+; 4.19.325 makes the 4.20 threshold truthy */|' "$FW"
+fi
+if [ -f "$FW" ]; then
+    cline_guards=$(grep -c 'ksu_419: remap_file_range is 5.0+' "$FW")
+    [ "$cline_guards" = 2 ] || fail "expected 2 remap_file_range guards in file_wrapper.c, found $cline_guards"
+    grep -q 'KERNEL_VERSION(4, 20, 0)' "$FW" && fail "a 4.20 version threshold survives in file_wrapper.c (truthy on 4.19.325)"
+fi
+
+# --- 5) [P0] the 4.x hook contract has to be routable ------------------------
+# tools/inline_hook_check.mk (included by KernelSU/kernel/Kbuild when
+# CONFIG_KSU_SUSFS=y) is a free, already-written gate: it $(error)s when a 3.x flag
+# survives in fs/read_write.c, drivers/input/input.c, fs/exec.c or fs/stat.c, and when
+# one of the required ksu_handle_* call sites is missing. Reproduce its checks here so a
+# broken tree fails during transformation instead of 20 minutes into the build.
+cline_hook_fail=0
+for cline_pair in "fs/read_write.c:ksu_vfs_read_hook" "fs/read_write.c:ksu_init_rc_hook" \
+                  "fs/stat.c:ksu_init_rc_hook" "drivers/input/input.c:ksu_input_hook" \
+                  "fs/exec.c:ksu_execveat_hook"; do
+    cline_f="${cline_pair%%:*}"; cline_s="${cline_pair##*:}"
+    if grep -qw "$cline_s" "$cline_f" 2>/dev/null; then
+        echo "   incompatible 3.x hook flag still present: $cline_s in $cline_f"
+        cline_hook_fail=1
+    fi
+done
+for cline_pair in "kernel/sys.c:ksu_handle_setresuid" "fs/exec.c:ksu_handle_execveat" \
+                  "fs/open.c:ksu_handle_faccessat" "fs/read_write.c:ksu_handle_sys_read" \
+                  "fs/stat.c:ksu_handle_stat" "kernel/reboot.c:ksu_handle_sys_reboot" \
+                  "drivers/input/input.c:ksu_handle_input_handle_event"; do
+    cline_f="${cline_pair%%:*}"; cline_s="${cline_pair##*:}"
+    grep -qw "$cline_s" "$cline_f" 2>/dev/null || {
+        echo "   required 4.x hook call site missing: $cline_s in $cline_f"
+        cline_hook_fail=1
+    }
+done
+[ "$cline_hook_fail" = 0 ] || fail "the 4.x inline-hook contract is not routable (see the lines above; KernelSU/kernel/tools/inline_hook_check.mk would fail the build)"
+
+echo "[cline] kernel tree transformed: SUSFS 2.2.0 applied, 1.5.7 stripped, KSU 4.19 compat in place."
+CLINE_TRANSFORM_EOF
+        export CLINE_REV_PATCH="$CLINE_DIR/susfs157_reverse.patch"
+        export CLINE_SUSFS_PATCH="$CLINE_DIR/susfs_patch_to_4.19.patch"
+        bash "$CLINE_DIR/cline-transform.sh"
+        echo "[cline] kernel tree prepared (ReSukiSU 4.x + SUSFS 2.2.0)."
+        echo "NOTE: [cline] the A/B 4.19 compat sweep above is skipped on the C line (different KSU tree)."
+    fi
+    # ===== C-LINE-BLOCK-END =====
 else
     echo "KSU is disabled"
 fi
@@ -1313,8 +1726,11 @@ if [ $KSU_ENABLE -eq 1 ]; then
     # KSU config block (AOSP): clean line = KSU + KPROBES + EXT4_FS with KPM **off**
     # (t17: KernelSU v4.2.0's kernel/kpm/kpm.c uses the 5.0+ two-argument
     # access_ok() and does not compile on 4.19 - see the gate below),
-    # SUSFS line = KSU + KSU_MANUAL_HOOK + KSU_SUSFS + KSU_SUSFS_* + KPM.
-    if [ "$WITH_SUSFS" -eq 1 ]; then
+    # SUSFS line = KSU + KSU_MANUAL_HOOK + KSU_SUSFS + KSU_SUSFS_* + KPM,
+    # C line = the ReSukiSU + SUSFS 2.2.0 symbol set (see cline_config()).
+    if [ "$WITH_SUSFS" -eq 2 ]; then
+        cline_config
+    elif [ "$WITH_SUSFS" -eq 1 ]; then
         scripts/config --file out/.config \
         -e KSU \
         -e KSU_MANUAL_HOOK \
@@ -1347,7 +1763,10 @@ if [ $KSU_ENABLE -eq 1 ]; then
     make $MAKE_ARGS olddefconfig
 
     require_config KSU
-    if [ "$WITH_SUSFS" -eq 1 ]; then
+    if [ "$WITH_SUSFS" -eq 2 ]; then
+        # cline_config() already ran olddefconfig and the full C-line gate set.
+        :
+    elif [ "$WITH_SUSFS" -eq 1 ]; then
         require_config KPM
         require_config KSU_SUSFS
         forbid_config KSU_SUSFS_SUS_SU
@@ -1386,7 +1805,10 @@ rm -rf anykernel/kernels/
 
 mkdir -p anykernel/kernels/
 
-# Patch for SukiSU KPM support. 
+# Patch for SukiSU KPM support.
+# C line: no KPM at all. ReSukiSU has no `config KPM` and no kernel/kpm/, so the image
+# patch is meaningless there (and `patch_linux` would look for KPatch-Next at boot,
+# which this line does not carry).
 if [ $KSU_ENABLE -eq 1 ] && [ "$WITH_SUSFS" -eq 1 ]; then
     cd out/arch/arm64/boot/
     # KPM image patch: SUSFS line only. The clean line builds with CONFIG_KPM=n
@@ -1497,8 +1919,11 @@ if [ $KSU_ENABLE -eq 1 ]; then
     # KSU config block (MIUI): clean line = KSU + KPROBES + EXT4_FS with KPM **off**
     # (t17: KernelSU v4.2.0's kernel/kpm/kpm.c uses the 5.0+ two-argument
     # access_ok() and does not compile on 4.19 - see the gate below),
-    # SUSFS line = KSU + KSU_MANUAL_HOOK + KSU_SUSFS + KSU_SUSFS_* + KPM.
-    if [ "$WITH_SUSFS" -eq 1 ]; then
+    # SUSFS line = KSU + KSU_MANUAL_HOOK + KSU_SUSFS + KSU_SUSFS_* + KPM,
+    # C line = the ReSukiSU + SUSFS 2.2.0 symbol set (see cline_config()).
+    if [ "$WITH_SUSFS" -eq 2 ]; then
+        cline_config
+    elif [ "$WITH_SUSFS" -eq 1 ]; then
         scripts/config --file out/.config \
         -e KSU \
         -e KSU_MANUAL_HOOK \
@@ -1531,7 +1956,10 @@ if [ $KSU_ENABLE -eq 1 ]; then
     make $MAKE_ARGS olddefconfig
 
     require_config KSU
-    if [ "$WITH_SUSFS" -eq 1 ]; then
+    if [ "$WITH_SUSFS" -eq 2 ]; then
+        # cline_config() already ran olddefconfig and the full C-line gate set.
+        :
+    elif [ "$WITH_SUSFS" -eq 1 ]; then
         require_config KPM
         require_config KSU_SUSFS
         forbid_config KSU_SUSFS_SUS_SU
@@ -1594,7 +2022,22 @@ scripts/config --file out/.config \
 make $MAKE_ARGS olddefconfig
 if [ $KSU_ENABLE -eq 1 ]; then
     require_config KSU
-    if [ "$WITH_SUSFS" -eq 1 ]; then
+    if [ "$WITH_SUSFS" -eq 2 ]; then
+        # The C line's MIUI-only fine tuning above could drop KSU_SUSFS (it is a
+        # `choice` arm, so anything that clears THREAD_INFO_IN_TASK would silently
+        # fall back to KSU_TRACEPOINT_HOOK). Re-assert the whole C-line set.
+        require_config KPROBES
+        require_config EXT4_FS
+        require_config THREAD_INFO_IN_TASK
+        require_config KSU_SUSFS
+        forbid_config KSU_TRACEPOINT_HOOK
+        forbid_config KSU_MANUAL_HOOK
+        forbid_symbol KPM
+        if ! grep -q '#define SUSFS_VERSION "v2.2.0"' include/linux/susfs.h; then
+            echo "FATAL: [cline] include/linux/susfs.h does not report SUSFS v2.2.0 after the MIUI config block."
+            exit 1
+        fi
+    elif [ "$WITH_SUSFS" -eq 1 ]; then
         require_config KPM
         require_config KSU_SUSFS
         forbid_config KSU_SUSFS_SUS_SU
