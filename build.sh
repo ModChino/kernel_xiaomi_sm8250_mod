@@ -23,8 +23,22 @@
 # KernelSU sources - all pinned to immutable commits:
 #   clean line : 85eb4a95b8a61d756ecf53b9c5785e48e1b15039 = tag v4.2.0
 #   SUSFS line : f4863b20cc8dc0f8cc67418980f022e43014b598 = liyafe1997/SukiSU-Ultra "susfs-1.5.7"
-#   C line     : f7be4a53bd39d4a03876eba5e888818b1a1fcaac = ReSukiSU/ReSukiSU, the
-#                commit behind the reference build's "v4.1.0-f7be4a53+3a62be00@ReSukiSU".
+#   C line     : 0e4698951b8e0e1cb997e46f2049c691869a4f45 = ReSukiSU/ReSukiSU main HEAD,
+#                the 4.2.0 line (was f7be4a53, the commit behind the reference build's
+#                "v4.1.0-f7be4a53+3a62be00@ReSukiSU").
+#                WHY 0e469895 AND NOT THE TAG: the manager and the kernel BOTH derive
+#                their version number from the same monorepo commit count
+#                  kernel : KSU_VERSION        = 30000 + rev-list --count HEAD + 700
+#                  manager: BuildConfig.VERSION_CODE = 30000 + getGitCommitCount() + 700
+#                and the manager's HomePage.kt gate is
+#                  if (ksuVersion > VERSION_CODE)                      -> OK
+#                  else if (ksuVersion < VERSION_CODE)                 -> "kernel needs update"
+#                so the kernel must report a number >= the manager's. A 4.2.0 manager is
+#                built at >= 4479 commits (VERSION_CODE >= 35179), therefore the kernel
+#                must also be at >= 4479 commits:
+#                  f7be4a53 (4351) -> 35051  TOO LOW, this is the reported bug
+#                  rc3 tag 239e1e88 (4471) -> 35171  STILL 8 SHORT
+#                  0e469895 (4479) -> 35179  PASSES
 #                NOTE: the v4.1.0 TAG (0d27e685, 2025-12-05) is a flat, older layout
 #                without KSU_SUSFS - do not pin the tag.
 #
@@ -101,7 +115,9 @@ KSU_REF_CLEAN=85eb4a95b8a61d756ecf53b9c5785e48e1b15039
 KSU_REF_SUSFS=f4863b20cc8dc0f8cc67418980f022e43014b598
 # C line: ReSukiSU 4.x. This is the KSU side of the reference build; the kernel side
 # (SUSFS 2.2.0) is downloaded and applied by the C-line block further down.
-KSU_REF_RE=f7be4a53bd39d4a03876eba5e888818b1a1fcaac
+# 4.2.0 line. Must stay at >= 4479 commits so the kernel reports KSU_VERSION >= 35179
+# and a 4.2.0 manager stops reporting "kernel needs update" (see the header note).
+KSU_REF_RE=0e4698951b8e0e1cb997e46f2049c691869a4f45
 # SUSFS 2.2.0 kernel-side patch (JackA1ltman/NonGKI_Kernel_Build_2nd, the only public
 # 4.19 source; it carries no KSU call sites, which is why the C-line block below adds
 # them itself). blob 4ae50a1264cfde4c2f9ec0d24a17329911445d61, 134634 B.
