@@ -10,7 +10,7 @@
 #                          -> Kernel_MIUI_enuma_SukiSU_*_anykernel3_*.zip
 #   WITH_SUSFS=1           SUSFS line : KernelSU carrying the SUSFS 1.5.x glue
 #                          -> Kernel_MIUI_enuma_SukiSU-SUSFS_*_anykernel3_*.zip
-#   WITH_SUSFS=2           C line     : ReSukiSU 4.x (KSU side) + SUSFS 2.2.0
+#   WITH_SUSFS=2           C line     : ReSukiSU 4.x (KSU side) + SUSFS 2.3.0
 #                          (kernel side, applied by this script on top of the fork's
 #                          own 1.5.7 code, which is stripped first)
 #                          -> Kernel_MIUI_enuma_ReSukiSU-SUSFS2_*_anykernel3_*.zip
@@ -93,7 +93,7 @@ TARGET_DEVICE=$1
 # MIUI_ONLY: 1 (default) = build the MIUI variant only, skip the AOSP block
 # WITH_SUSFS: 0 (default) = clean SukiSU v4.2.0 line
 #             1           = SukiSU 3.x + in-tree SUSFS 1.5.7 line
-#             2           = C line: ReSukiSU 4.x + SUSFS 2.2.0 (kernel side patched here)
+#             2           = C line: ReSukiSU 4.x + SUSFS 2.3.0 (kernel side patched here)
 MIUI_ONLY=${MIUI_ONLY:-1}
 WITH_SUSFS=${WITH_SUSFS:-0}
 
@@ -104,7 +104,7 @@ esac
 
 case "$WITH_SUSFS" in
     0|1|2) ;;
-    *) echo "WITH_SUSFS must be 0, 1 or 2 (got: [$WITH_SUSFS]); 2 = the ReSukiSU + SUSFS 2.2.0 C line"; exit 1 ;;
+    *) echo "WITH_SUSFS must be 0, 1 or 2 (got: [$WITH_SUSFS]); 2 = the ReSukiSU + SUSFS 2.3.0 C line"; exit 1 ;;
 esac
 
 # ---- KernelSU sources (immutable commits) ----------------------------------
@@ -114,15 +114,23 @@ KSU_REF_CLEAN=85eb4a95b8a61d756ecf53b9c5785e48e1b15039
 # in-kernel SUSFS 1.5.7 fs-side code)
 KSU_REF_SUSFS=f4863b20cc8dc0f8cc67418980f022e43014b598
 # C line: ReSukiSU 4.x. This is the KSU side of the reference build; the kernel side
-# (SUSFS 2.2.0) is downloaded and applied by the C-line block further down.
+# (SUSFS 2.3.0) is downloaded and applied by the C-line block further down.
 # 4.2.0 line. Must stay at >= 4479 commits so the kernel reports KSU_VERSION >= 35179
 # and a 4.2.0 manager stops reporting "kernel needs update" (see the header note).
 KSU_REF_RE=0e4698951b8e0e1cb997e46f2049c691869a4f45
-# SUSFS 2.2.0 kernel-side patch (JackA1ltman/NonGKI_Kernel_Build_2nd, the only public
+# SUSFS 2.3.0 kernel-side patch (JackA1ltman/NonGKI_Kernel_Build_2nd, the only public
 # 4.19 source; it carries no KSU call sites, which is why the C-line block below adds
-# them itself). blob 4ae50a1264cfde4c2f9ec0d24a17329911445d61, 134634 B.
-SUSFS_220_URL=https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/7caf07c44806c1086ba28236c60722fb5699d2b6/Patches/Patch/susfs_patch_to_4.19.patch
-SUSFS_220_BLOB=4ae50a1264cfde4c2f9ec0d24a17329911445d61
+# them itself). blob 6fc809dce97974ea1c99c3ee97429a203a0ebae7, 143835 B.
+# WAS 2.2.0 (blob 4ae50a12..., 134634 B) - see the header note on why it had to move:
+# ReSukiSU 4.2.0's kernel/feature/sucompat.h maps its internal API onto
+# susfs_{is,set,clear}_current_proc_no_su and
+# susfs_set_current_proc_umounted_for_zygote_next, NONE of which SUSFS 2.2.0 declares
+# (it only has susfs_is_current_proc_umounted/_app). The mismatch is a LINK error,
+# not a compile error (run15: undefined reference in sucompat.o / setuid_hook.o).
+# 2.3.0 declares all four in include/linux/susfs_def.h, which is the header
+# sucompat.h includes. ReSukiSU 4.2.0 and SUSFS 2.3.0 must therefore move together.
+SUSFS_230_URL=https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/6b9e7acf958d750088c47af5d368f69767c4dac9/Patches/Patch/susfs_patch_to_4.19.patch
+SUSFS_230_BLOB=6fc809dce97974ea1c99c3ee97429a203a0ebae7
 # Official setup.sh of v4.2.0 (blob 7e57e19b8408c7542865af5076cbee28783b3c7c).
 # It clones https://github.com/SukiSU-Ultra/SukiSU-Ultra (unless a KernelSU/
 # directory already exists), wires it into drivers/ and checks out the ref given
@@ -267,7 +275,7 @@ forbid_symbol() {
 
 # ---- C line (WITH_SUSFS=2) config, shared by the AOSP and MIUI blocks ----------
 # The C line's config surface is a different symbol set from the A/B lines':
-#   * SUSFS 2.2.0 declares exactly 10 KSU_SUSFS_* symbols (no HAS_MAGIC_MOUNT, no
+#   * SUSFS 2.3.0 declares exactly 10 KSU_SUSFS_* symbols (no HAS_MAGIC_MOUNT, no
 #     SUS_OVERLAYFS, no SUS_SU, no TRY_UMOUNT family) - and no KPM at all;
 #   * KSU_SUSFS is a `choice` arm next to KSU_TRACEPOINT_HOOK / KSU_MANUAL_HOOK, so
 #     selecting it is what makes ReSukiSU use SUSFS inline hooks. If its dependency
@@ -307,11 +315,11 @@ cline_config() {
     forbid_symbol KPM
     # the version assertion the C line needs on top of `KSU_SUSFS=y`: the tree could
     # otherwise carry the wrong SUSFS generation and still satisfy every =y gate.
-    if ! grep -q '#define SUSFS_VERSION "v2.2.0"' include/linux/susfs.h; then
-        echo "FATAL: [cline] include/linux/susfs.h does not report SUSFS v2.2.0."
+    if ! grep -q '#define SUSFS_VERSION "v2.3.0"' include/linux/susfs.h; then
+        echo "FATAL: [cline] include/linux/susfs.h does not report SUSFS v2.3.0."
         exit 1
     fi
-    echo "[cline] config gates passed: KSU + KSU_SUSFS(2.2.0) + 9 SUSFS features + THREAD_INFO_IN_TASK, KPM absent."
+    echo "[cline] config gates passed: KSU + KSU_SUSFS(2.3.0) + 9 SUSFS features + THREAD_INFO_IN_TASK, KPM absent."
 }
 
 
@@ -1319,7 +1327,7 @@ T49COMPAT
         fi
         echo "t49 seccomp fix applied: seccomp_filter_release guarded at 5.9, 4.19 uses put_seccomp_filter."
     else
-        if [ "$WITH_SUSFS" -le 1 ]; then echo "NOTE: KernelSU/kernel/runtime/ksud_integration.c not present (3.x SUSFS tree) - the t49 legacy hook compat layer is not needed (the 3.x tree defines that API itself)."; else echo "SKIP [cline]: the t49 legacy hook compat layer is A/B-only (this is the C line; the file exists, and stubbing it would collide with the 2.2.0 patch call sites)."; fi
+        if [ "$WITH_SUSFS" -le 1 ]; then echo "NOTE: KernelSU/kernel/runtime/ksud_integration.c not present (3.x SUSFS tree) - the t49 legacy hook compat layer is not needed (the 3.x tree defines that API itself)."; else echo "SKIP [cline]: the t49 legacy hook compat layer is A/B-only (this is the C line; the file exists, and stubbing it would collide with the 2.3.0 patch call sites)."; fi
     fi
 
     # t55: real-device oops (ramoops: 6 crashes at 2.14-2.20s, ESR 0x96000005,
@@ -1424,12 +1432,12 @@ T55SITES
     fi
     # ===== C-LINE-BLOCK-START =====
 
-    # ===================== C line: ReSukiSU 4.x + SUSFS 2.2.0 ==================
+    # ===================== C line: ReSukiSU 4.x + SUSFS 2.3.0 ==================
     # Everything in this `if [ $KSU_ENABLE -eq 1 ]` block above is the A/B-line 4.19
     # compat sweep for the SukiSU tree. The C line is a different KSU tree (ReSukiSU
     # carries its own 4.19 compatibility layer) and needs a different kernel-side
     # change: the fork's baseline ships SUSFS 1.5.7 inside fs/ + include/linux/ +
-    # kernel/, which has to be stripped before the SUSFS 2.2.0 kernel patch can
+    # kernel/, which has to be stripped before the SUSFS 2.3.0 kernel patch can
     # apply, and the 2.x hook call sites then have to be installed with the
     # signatures the 4.x KSU tree declares. None of that touches A or B: this block
     # runs only for WITH_SUSFS=2, and the C line is built in its own CI job from its
@@ -1464,17 +1472,17 @@ CLINE_PATCH_B64
             exit 1
         fi
 
-        # ---- the SUSFS 2.2.0 kernel-side patch (downloaded, pinned, blob-checked)
+        # ---- the SUSFS 2.3.0 kernel-side patch (downloaded, pinned, blob-checked)
         # 134 kB of third-party patch does not belong in this script; the URL is an
         # immutable commit and the blob id is asserted, so a silently rewritten
         # upstream file can never be compiled in.
-        curl -LSs "$SUSFS_220_URL" -o "$CLINE_DIR/susfs_patch_to_4.19.patch"
+        curl -LSs "$SUSFS_230_URL" -o "$CLINE_DIR/susfs_patch_to_4.19.patch"
         cline_blob=$(git hash-object "$CLINE_DIR/susfs_patch_to_4.19.patch")
-        if [ "$cline_blob" != "$SUSFS_220_BLOB" ]; then
-            echo "FATAL: [cline] SUSFS 2.2.0 patch blob mismatch: got [$cline_blob], expected [$SUSFS_220_BLOB]."
+        if [ "$cline_blob" != "$SUSFS_230_BLOB" ]; then
+            echo "FATAL: [cline] SUSFS 2.3.0 patch blob mismatch: got [$cline_blob], expected [$SUSFS_230_BLOB]."
             exit 1
         fi
-        echo "[cline] SUSFS 2.2.0 patch verified (blob $cline_blob)."
+        echo "[cline] SUSFS 2.3.0 patch verified (blob $cline_blob)."
 
         # ---- transform the kernel tree, then run every gate ------------------
         # The transform is a heredoc script rather than a repository file: the
@@ -1484,14 +1492,14 @@ CLINE_PATCH_B64
         # enuma_kernel_build/_recon3/run_cline_transform.sh.
         cat > "$CLINE_DIR/cline-transform.sh" <<'CLINE_TRANSFORM_EOF'
 #!/usr/bin/env bash
-# cline-transform.sh - the C-line (ReSukiSU 4.x + SUSFS 2.2.0 on 4.19.325) kernel-tree
+# cline-transform.sh - the C-line (ReSukiSU 4.x + SUSFS 2.3.0 on 4.19.325) kernel-tree
 # transformation, extracted verbatim from build.sh so it can be exercised on a real
 # tree without running the whole build. Must be run from the KERNEL TREE ROOT with
 # KernelSU/ already in place.
 #
 # Environment (set by build.sh):
 #   CLINE_REV_PATCH   absolute native path of the 1.5.7 reversal patch
-#   CLINE_SUSFS_PATCH absolute native path of the SUSFS 2.2.0 4.19 patch
+#   CLINE_SUSFS_PATCH absolute native path of the SUSFS 2.3.0 4.19 patch
 set -u
 rc_all=0
 fail() { echo "FATAL: [cline] $*"; exit 1; }
@@ -1552,8 +1560,8 @@ mkdir -p out/.cline/code
 
 # --- 1) strip the in-tree SUSFS 1.5.7 -----------------------------------------
 # The fork's baseline already carries SUSFS 1.5.7 (fs/susfs.c, fs/sus_su.c,
-# include/linux/susfs.h + hooks in 22 files), and SUSFS 2.2.0 replaces exactly those
-# files. Without the strip the 2.2.0 patch cannot apply (19 files / 42 errors -
+# include/linux/susfs.h + hooks in 22 files), and SUSFS 2.3.0 replaces exactly those
+# files. Without the strip the 2.3.0 patch cannot apply (19 files / 42 errors -
 # measured), so the order strip-then-patch is mandatory, not stylistic.
 if [ -e fs/susfs.c ] && grep -q '#define SUSFS_VERSION "v1.5.7"' include/linux/susfs.h 2>/dev/null; then
     echo "[cline] 1.5.7 present -> stripping"
@@ -1581,24 +1589,24 @@ if [ "${cline_stripped_already:-0}" = 0 ]; then
 fi
 
 # CLINE_STOP_AFTER_STRIP=1 is a test hook: it leaves the tree in the "stripped but not
-# yet 2.2.0" state so the residue gate above can be exercised end to end on a real tree.
+# yet 2.3.0" state so the residue gate above can be exercised end to end on a real tree.
 if [ "${CLINE_STOP_AFTER_STRIP:-0}" = "1" ]; then
     echo "[cline] stopping after the strip (CLINE_STOP_AFTER_STRIP=1)"
     exit 0
 fi
 
-# --- 2) apply SUSFS 2.2.0 (kernel side) ---------------------------------------
+# --- 2) apply SUSFS 2.3.0 (kernel side) ---------------------------------------
 # The 2.x kernel-side and KSU-side halves are split: this patch is the kernel half
 # ONLY (19 files, no ksu_handle_* call sites), which is why step 3 exists.
-if grep -q '#define SUSFS_VERSION "v2.2.0"' include/linux/susfs.h 2>/dev/null; then
-    echo "[cline] SUSFS 2.2.0 already applied"
+if grep -q '#define SUSFS_VERSION "v2.3.0"' include/linux/susfs.h 2>/dev/null; then
+    echo "[cline] SUSFS 2.3.0 already applied"
 else
     git apply --ignore-whitespace --whitespace=nowarn "$CLINE_SUSFS_PATCH" \
-        || fail "the SUSFS 2.2.0 kernel patch did not apply"
+        || fail "the SUSFS 2.3.0 kernel patch did not apply"
 fi
-grep -q '#define SUSFS_VERSION "v2.2.0"' include/linux/susfs.h || fail "include/linux/susfs.h has no SUSFS v2.2.0 marker"
+grep -q '#define SUSFS_VERSION "v2.3.0"' include/linux/susfs.h || fail "include/linux/susfs.h has no SUSFS v2.3.0 marker"
 grep -q 'CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile || fail "fs/Makefile is not wired to susfs.o"
-[ -e include/linux/susfs_def.h ] || fail "include/linux/susfs_def.h missing after the 2.2.0 patch"
+[ -e include/linux/susfs_def.h ] || fail "include/linux/susfs_def.h missing after the 2.3.0 patch"
 
 # --- 3) inline-hook call sites for ReSukiSU's 4.x conventions -----------------
 # KernelSU 4.x drives these hooks from its own inline-hooked call sites and has no
@@ -1606,7 +1614,7 @@ grep -q 'CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile || fail "fs/Makefile is not w
 # tools/inline_hook_check.mk: it $(error)s when an old flag is still present in
 # fs/read_write.c, drivers/input/input.c, fs/exec.c or fs/stat.c, and when one of the
 # required ksu_handle_* call sites is missing. Five files need work here; fs/open.c,
-# fs/read_write.c's and fs/stat.c's new call sites already come from the 2.2.0 patch.
+# fs/read_write.c's and fs/stat.c's new call sites already come from the 2.3.0 patch.
 CLINE_MARK='cline: 4.x inline hook'
 
 # 3a) fs/exec.c - the 5-arg ksu_handle_execveat_sucompat() call is the site that
@@ -1741,12 +1749,12 @@ if grep -q 'ksu_handle_execveat_sucompat' out/.cline/code/exec.c; then
     fail "fs/exec.c still calls ksu_handle_execveat_sucompat with the 3.x convention (the device oops)"
 fi
 
-# 3b) fs/read_write.c - drop the 3.x flag guard; the 2.2.0 patch already installed the
+# 3b) fs/read_write.c - drop the 3.x flag guard; the 2.3.0 patch already installed the
 # 3-arg ksu_handle_sys_read(fd, &buf, &count) call the KSU tree declares.
 if ! grep -q 'cline: 4.x inline hook (read)' fs/read_write.c; then
     sed -i '/^[[:space:]]*if (unlikely(ksu_vfs_read_hook))$/d' fs/read_write.c
     sed -i '/^extern bool ksu_vfs_read_hook __read_mostly;$/d' fs/read_write.c
-    sed -i '0,/^#ifdef CONFIG_KSU$/s|^#ifdef CONFIG_KSU$|/* cline: 4.x inline hook (read): the 3.x enable flag is gone (inline_hook_check.mk\n * rejects it); the call site comes from the SUSFS 2.2.0 patch. */\n#ifdef CONFIG_KSU|' fs/read_write.c
+    sed -i '0,/^#ifdef CONFIG_KSU$/s|^#ifdef CONFIG_KSU$|/* cline: 4.x inline hook (read): the 3.x enable flag is gone (inline_hook_check.mk\n * rejects it); the call site comes from the SUSFS 2.3.0 patch. */\n#ifdef CONFIG_KSU|' fs/read_write.c
 fi
 cline_code_file fs/read_write.c out/.cline/code/read_write.c
 if grep -q 'ksu_vfs_read_hook' out/.cline/code/read_write.c; then
@@ -1793,7 +1801,7 @@ if ! grep -q 'ksu_handle_sys_reboot' kernel/reboot.c; then
 fi
 grep -q 'ksu_handle_sys_reboot' kernel/reboot.c || fail "kernel/reboot.c has no ksu_handle_sys_reboot call site"
 
-# 3f) fs/proc/task_mmu.c - run12 defect 2. The upstream SUSFS 2.2.0 patch declares
+# 3f) fs/proc/task_mmu.c - run12 defect 2. The upstream SUSFS 2.3.0 patch declares
 # `spoofed_redirected_name` TWICE in show_map_vma():
 #   :374  function level, inside `#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT`   (outer)
 #   :381  inside `if (SUSFS_IS_INODE_OPEN_REDIRECT(inode)) {`             (inner)
@@ -1805,7 +1813,7 @@ grep -q 'ksu_handle_sys_reboot' kernel/reboot.c || fail "kernel/reboot.c has no 
 # open_redirect feature still works - unlike silencing the warning or disabling
 # CONFIG_KSU_SUSFS_OPEN_REDIRECT, both of which are forbidden here.
 #
-# The file is touched by the 2.2.0 patch ONLY (this transform had no task_mmu rule before),
+# The file is touched by the 2.3.0 patch ONLY (this transform had no task_mmu rule before),
 # so the guard is: the outer declaration exists AND the inner one exists.
 if ! grep -q 'cline: 4.x task_mmu duplicate' fs/proc/task_mmu.c; then
     tm_outer=$(grep -c '^	char \*spoofed_redirected_name = NULL;[[:space:]]*$' fs/proc/task_mmu.c)
@@ -1846,7 +1854,7 @@ if grep -q 'cline: 4.x task_mmu duplicate' fs/proc/task_mmu.c; then
     [ "$tm_refs" -ge 6 ] || fail "fs/proc/task_mmu.c: the inner declaration/uses were removed too (refs=$tm_refs)"
     echo "[cline] fs/proc/task_mmu.c: duplicate declaration now explicitly used ($tm_uses sites, $tm_refs references)."
 else
-    fail "fs/proc/task_mmu.c: the SUSFS 2.2.0 duplicate-declaration defect was not handled (outer=$tm_outer inner=$tm_inner)"
+    fail "fs/proc/task_mmu.c: the SUSFS 2.3.0 duplicate-declaration defect was not handled (outer=$tm_outer inner=$tm_inner)"
 fi
 
 # --- 4) KSU-side 4.19 compat --------------------------------------------------
@@ -2042,12 +2050,12 @@ for cline_f in fs/exec.c fs/read_write.c fs/stat.c fs/open.c drivers/input/input
 done
 echo "[cline] structural gate: every 3.x hook block was deleted atomically (no else without its if)."
 
-echo "[cline] kernel tree transformed: SUSFS 2.2.0 applied, 1.5.7 stripped, KSU 4.19 compat in place."
+echo "[cline] kernel tree transformed: SUSFS 2.3.0 applied, 1.5.7 stripped, KSU 4.19 compat in place."
 CLINE_TRANSFORM_EOF
         export CLINE_REV_PATCH="$CLINE_DIR/susfs157_reverse.patch"
         export CLINE_SUSFS_PATCH="$CLINE_DIR/susfs_patch_to_4.19.patch"
         bash "$CLINE_DIR/cline-transform.sh"
-        echo "[cline] kernel tree prepared (ReSukiSU 4.x + SUSFS 2.2.0)."
+        echo "[cline] kernel tree prepared (ReSukiSU 4.x + SUSFS 2.3.0)."
         echo "NOTE: [cline] the A/B 4.19 compat sweep above is skipped on the C line (different KSU tree)."
     fi
     # ===== C-LINE-BLOCK-END =====
@@ -2089,7 +2097,7 @@ if [ $KSU_ENABLE -eq 1 ]; then
     # (t17: KernelSU v4.2.0's kernel/kpm/kpm.c uses the 5.0+ two-argument
     # access_ok() and does not compile on 4.19 - see the gate below),
     # SUSFS line = KSU + KSU_MANUAL_HOOK + KSU_SUSFS + KSU_SUSFS_* + KPM,
-    # C line = the ReSukiSU + SUSFS 2.2.0 symbol set (see cline_config()).
+    # C line = the ReSukiSU + SUSFS 2.3.0 symbol set (see cline_config()).
     if [ "$WITH_SUSFS" -eq 2 ]; then
         cline_config
     elif [ "$WITH_SUSFS" -eq 1 ]; then
@@ -2282,7 +2290,7 @@ if [ $KSU_ENABLE -eq 1 ]; then
     # (t17: KernelSU v4.2.0's kernel/kpm/kpm.c uses the 5.0+ two-argument
     # access_ok() and does not compile on 4.19 - see the gate below),
     # SUSFS line = KSU + KSU_MANUAL_HOOK + KSU_SUSFS + KSU_SUSFS_* + KPM,
-    # C line = the ReSukiSU + SUSFS 2.2.0 symbol set (see cline_config()).
+    # C line = the ReSukiSU + SUSFS 2.3.0 symbol set (see cline_config()).
     if [ "$WITH_SUSFS" -eq 2 ]; then
         cline_config
     elif [ "$WITH_SUSFS" -eq 1 ]; then
@@ -2395,8 +2403,8 @@ if [ $KSU_ENABLE -eq 1 ]; then
         forbid_config KSU_TRACEPOINT_HOOK
         forbid_config KSU_MANUAL_HOOK
         forbid_symbol KPM
-        if ! grep -q '#define SUSFS_VERSION "v2.2.0"' include/linux/susfs.h; then
-            echo "FATAL: [cline] include/linux/susfs.h does not report SUSFS v2.2.0 after the MIUI config block."
+        if ! grep -q '#define SUSFS_VERSION "v2.3.0"' include/linux/susfs.h; then
+            echo "FATAL: [cline] include/linux/susfs.h does not report SUSFS v2.3.0 after the MIUI config block."
             exit 1
         fi
     elif [ "$WITH_SUSFS" -eq 1 ]; then
