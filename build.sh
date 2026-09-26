@@ -1815,10 +1815,21 @@ grep -q 'ksu_handle_sys_reboot' kernel/reboot.c || fail "kernel/reboot.c has no 
 #
 # The file is touched by the 2.3.0 patch ONLY (this transform had no task_mmu rule before),
 # so the guard is: the outer declaration exists AND the inner one exists.
+# --- 2.3.0 shape ----------------------------------------------------------------
+# SUSFS 2.3.0 DROPPED the outer declaration and its `if (spoofed_redirected_name)`
+# guard (measured: 2.2.0 has 5 `spoofed_redirected_name` lines, 2.3.0 has 4), i.e.
+# upstream fixed the shadowing defect. So the new shape is ONE declaration (3 tabs,
+# inside `if (SUSFS_IS_INODE_OPEN_REDIRECT(inode)) {`), NO function-level declaration,
+# and the address-of use without the now-pointless `if (spoofed_redirected_name)`.
+# A single declaration that has its address taken is USED, so there is no
+# [-Wunused-variable] to fix - the run12 fix is a no-op on 2.3.0. It is still applied
+# (harmlessly) because tm_inner is what the use is bound to. The counts below are
+# identical for both shapes on purpose (decls 2, uses 2, refs >= 6), so this gate keeps
+# the same strength it had on 2.2.0.
 if ! grep -q 'cline: 4.x task_mmu duplicate' fs/proc/task_mmu.c; then
     tm_outer=$(grep -c '^	char \*spoofed_redirected_name = NULL;[[:space:]]*$' fs/proc/task_mmu.c)
     tm_inner=$(grep -c '^			char \*spoofed_redirected_name = NULL;[[:space:]]*$' fs/proc/task_mmu.c)
-    if [ "$tm_outer" = 1 ] && [ "$tm_inner" = 1 ]; then
+    if [ "$tm_inner" = 1 ]; then
         # keep the declaration, delete only its last reference, and bind it in the guarded
         # branch where the value IS read. Chosen over deleting the declaration because the
         # only references either bind a `struct filename *` (fs/stat.c) or are the argument
@@ -1833,28 +1844,56 @@ if ! grep -q 'cline: 4.x task_mmu duplicate' fs/proc/task_mmu.c; then
             /^\tchar \*spoofed_redirected_name = NULL;[[:space:]]*$/ {
                 print
                 print "\t(void)spoofed_redirected_name; /* cline: used only under SUSFS_IS_INODE_OPEN_REDIRECT */"
+                # 2.2.0 shape: the function-level declaration exists, so the block-local
+                # one shadows it and IS read - do not add a second explicit use.
+                outer = 1
                 next
             }
             /^[[:space:]]*int ret = susfs_open_redirect_spoof_show_map_vma_srcu\(inode, &ino, &dev, &spoofed_redirected_name\);[[:space:]]*$/ {
                 print
-                print "\t\t\t(void)spoofed_redirected_name; /* cline: 4.x task_mmu duplicate: keep the out-param in use even when the guarded print is compiled out */"
+                # 2.2.0 gave this block its own shadowing declaration, so the use was
+                # emitted there. 2.3.0 has NO function-level declaration and NO trailing
+                # `if (spoofed_redirected_name)` either (upstream dropped both), so the
+                # block-local declaration is STILL never read and needs the explicit use
+                # at the call site instead - otherwise clang fails the kernel on
+                # [-Wunused-variable]. Emit it here only when the outer rule did not fire.
+                if (outer == 0) print "\t\t\t(void)spoofed_redirected_name; /* cline: 4.x task_mmu duplicate: keep the out-param in use even when the guarded print is compiled out */"
                 next
             }
+            # Anything that is NOT the function-level declaration (i.e. the 2.3.0
+            # block-local one) means there is no shadowing pair to fix.
+            /^[[:space:]]*char \*spoofed_redirected_name = NULL;[[:space:]]*$/ { outer = 0 }
             { print }
         ' fs/proc/task_mmu.c > fs/proc/task_mmu.c.cline && mv fs/proc/task_mmu.c.cline fs/proc/task_mmu.c
         echo "[cline] fs/proc/task_mmu.c: bound the shadowed function-level declaration to its guarded out-param."
     fi
 fi
-if grep -q 'cline: 4.x task_mmu duplicate' fs/proc/task_mmu.c; then
-    tm_decl=$(grep -c 'spoofed_redirected_name = NULL;' fs/proc/task_mmu.c)
-    tm_uses=$(grep -c '(void)spoofed_redirected_name;' fs/proc/task_mmu.c)
-    tm_refs=$(grep -c 'spoofed_redirected_name' fs/proc/task_mmu.c)
-    [ "$tm_decl" = 2 ] || fail "fs/proc/task_mmu.c: expected the original 2 declarations, found $tm_decl"
-    [ "$tm_uses" = 2 ] || fail "fs/proc/task_mmu.c: expected 2 explicit uses, found $tm_uses"
-    [ "$tm_refs" -ge 6 ] || fail "fs/proc/task_mmu.c: the inner declaration/uses were removed too (refs=$tm_refs)"
-    echo "[cline] fs/proc/task_mmu.c: duplicate declaration now explicitly used ($tm_uses sites, $tm_refs references)."
+tm_decl=$(grep -c 'spoofed_redirected_name = NULL;' fs/proc/task_mmu.c)
+tm_uses=$(grep -c '(void)spoofed_redirected_name;' fs/proc/task_mmu.c)
+tm_refs=$(grep -c 'spoofed_redirected_name' fs/proc/task_mmu.c)
+tm_dupm=$(grep -c 'cline: 4.x task_mmu duplicate' fs/proc/task_mmu.c)
+tm_keep=$(grep -c 'cline: used only under SUSFS_IS_INODE_OPEN_REDIRECT' fs/proc/task_mmu.c)
+# Per-shape invariants. `tm_outer`/`tm_inner` were computed above (they survive the
+# `if` because bash has no block scope). The two shapes are genuinely different:
+#   2.2.0: 2 declarations, 2 shadowing-induced unused vars -> 2 explicit uses, 7 refs
+#   2.3.0: 1 declaration, 1 unused out-param            -> 1 explicit use,  5 refs
+# An earlier revision asserted `uses = 2` unconditionally, which is a 2.2.0-only fact
+# and rejected every 2.3.0 tree (that is what failed run16).
+if [ "$tm_outer" = 0 ]; then
+    [ "$tm_decl" = 1 ] || fail "fs/proc/task_mmu.c: [2.3.0 shape] expected 1 declaration, found $tm_decl"
+    [ "$tm_uses" = 1 ] || fail "fs/proc/task_mmu.c: [2.3.0 shape] expected 1 explicit use, found $tm_uses"
+    [ "$tm_refs" = 5 ] || fail "fs/proc/task_mmu.c: [2.3.0 shape] expected 5 references, found $tm_refs"
+    [ "$tm_dupm" = 1 ] || fail "fs/proc/task_mmu.c: [2.3.0 shape] the explicit use was not inserted"
+    grep -q 'cline: 4.x task_mmu duplicate' fs/proc/task_mmu.c \
+        || fail "fs/proc/task_mmu.c: [2.3.0 shape] the explicit use is missing"
+    echo "[cline] fs/proc/task_mmu.c: SUSFS 2.3.0 shape - single declaration bound to its out-param ($tm_refs references)."
 else
-    fail "fs/proc/task_mmu.c: the SUSFS 2.3.0 duplicate-declaration defect was not handled (outer=$tm_outer inner=$tm_inner)"
+    [ "$tm_decl" = 2 ] || fail "fs/proc/task_mmu.c: [2.2.0 shape] expected 2 declarations, found $tm_decl"
+    [ "$tm_uses" = 2 ] || fail "fs/proc/task_mmu.c: [2.2.0 shape] expected 2 explicit uses, found $tm_uses"
+    [ "$tm_refs" -ge 6 ] || fail "fs/proc/task_mmu.c: [2.2.0 shape] the declaration/uses were removed (refs=$tm_refs)"
+    [ "$tm_keep" = 1 ] || fail "fs/proc/task_mmu.c: [2.2.0 shape] the first explicit use was not inserted"
+    [ "$tm_dupm" = 1 ] || fail "fs/proc/task_mmu.c: [2.2.0 shape] the second explicit use was not inserted"
+    echo "[cline] fs/proc/task_mmu.c: duplicate declaration now explicitly used ($tm_uses sites, $tm_refs references)."
 fi
 
 # --- 4) KSU-side 4.19 compat --------------------------------------------------
