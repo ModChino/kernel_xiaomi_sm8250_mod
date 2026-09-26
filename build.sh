@@ -1896,6 +1896,28 @@ else
     echo "[cline] fs/proc/task_mmu.c: duplicate declaration now explicitly used ($tm_uses sites, $tm_refs references)."
 fi
 
+# 3g) fs/stat.c - SUSFS 2.3.0 port gap (the run17 blocker).
+# 2.3.0's vfs_getattr_nosec() calls susfs_is_current_app_uid() and ORs
+# STATX_SUS_KSTAT / STATX_SUS_KSTAT_FUSE into stat->result_mask. All three live in
+# <linux/susfs_def.h>, but the 2.3.0 patch only added that include to
+# fs/proc/task_mmu.c - it left fs/stat.c with the two `extern` declarations from the
+# 2.2.0 era (2.2.0's stat.c needed neither the macro nor the inline, so the gap was
+# invisible then). Result on 4.19 with -Werror:
+#   fs/stat.c:85:6:  error: implicit declaration of function 'susfs_is_current_app_uid'
+#   fs/stat.c:91:26: error: use of undeclared identifier 'STATX_SUS_KSTAT'
+# (11 errors, all in fs/stat.c; `make -k` shows no other file is affected.)
+# Guarded on the 2.3.0 marker so a 2.2.0 tree stays a no-op.
+if grep -q '#define SUSFS_VERSION "v2.3.0"' include/linux/susfs.h 2>/dev/null; then
+    if [ -e fs/stat.c ] && ! grep -q 'include <linux/susfs_def.h>' fs/stat.c; then
+        sed -i 's|^#include <asm/unistd.h>$|#include <asm/unistd.h>\n#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h> /* cline: 2.3.0 stat.c port gap */\n#endif|' fs/stat.c
+    fi
+    grep -q 'include <linux/susfs_def.h>' fs/stat.c \
+        || fail "fs/stat.c: susfs_def.h was not added (2.3.0 needs STATX_SUS_KSTAT and susfs_is_current_app_uid)"
+    echo "[cline] fs/stat.c: susfs_def.h included (SUSFS 2.3.0 port gap closed)."
+else
+    echo "NOTE: [cline] SUSFS is not 2.3.0 - the fs/stat.c def.h include is a 2.3.0-only fix, skipped."
+fi
+
 # --- 4) KSU-side 4.19 compat --------------------------------------------------
 # 4a) copy_to_user_nofault()/copy_from_user_nofault() are 5.8+; this tree spells them
 #     probe_user_write()/probe_user_read() with the same contract. ReSukiSU's compat
